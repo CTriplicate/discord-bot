@@ -1,92 +1,21 @@
 """
-Генератор картинки турнирной сетки (Single Elimination).
+Генератор текстовой турнирной сетки (Single Elimination).
 
-Стиль: классическая турнирная сетка слева направо.
-- Белый фон, тонкие линии соединений
-- Матчи — прямоугольники с двумя слотами команд
-- L-образные соединительные линии между раундами
+Стиль: текстовая сетка с использованием Unicode box-drawing символов.
+- Код-блок для моноширинного отображения в Discord
+- Матчи с двумя слотами команд, связанные линиями
 - Автоматическое масштабирование под количество участников
-- Поддержка кириллицы (DejaVuSans)
+- Статусы матчей: ⏳ ожидание, ⚔️ идёт, ✅ завершён
 """
 
 from __future__ import annotations
 
 import math
-from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
-# Цвета
+# Хелперы
 # ---------------------------------------------------------------------------
-
-BG_COLOR = (255, 255, 255)
-
-# Бокс матча
-BOX_BG = (255, 255, 255)
-BOX_BG_WINNER = (240, 255, 240)       # светло-зелёный для победителя
-BOX_BG_LOSER = (250, 250, 250)        # чуть темнее для проигравшего
-BOX_BG_BYE = (245, 245, 245)          # для Bye/TBD слотов
-BOX_BORDER = (190, 195, 200)          # серая рамка
-BOX_BORDER_PLAYING = (255, 193, 7)    # жёлтая — матч идёт
-BOX_BORDER_COMPLETED = (76, 175, 80)  # зелёная — матч завершён
-DIVIDER_COLOR = (210, 215, 220)       # разделитель внутри матча
-
-# Текст
-TEXT_COLOR = (40, 40, 50)
-TBD_COLOR = (170, 175, 180)
-WINNER_COLOR = (33, 120, 50)
-LOSER_COLOR = (140, 145, 150)
-SEED_COLOR = (100, 130, 200)
-SCORE_COLOR = (120, 125, 130)
-
-# Линии соединений
-LINE_COLOR = (170, 175, 185)
-
-# Заголовки
-TITLE_COLOR = (50, 55, 65)
-ROUND_LABEL_COLOR = (130, 135, 145)
-
-# ---------------------------------------------------------------------------
-# Размеры (базовые — масштабируются автоматически)
-# ---------------------------------------------------------------------------
-
-BASE_BOX_W = 200
-BASE_TEAM_H = 26          # высота одного слота команды
-BASE_BOX_GAP = 0          # между team1 и team2 внутри матча (разделитель)
-BASE_MATCH_GAP_V = 18     # вертикальный зазор между матчами в раунде 1
-BASE_ROUND_GAP = 64       # горизонтальный зазор между раундами
-BASE_MARGIN_X = 40
-BASE_MARGIN_Y = 50
-BASE_FONT = 12
-BASE_TITLE_FONT = 18
-BASE_ROUND_FONT = 11
-
-
-def _font(size: int, bold: bool = False):
-    paths = []
-    if bold:
-        paths.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-    paths += [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    ]
-    for p in paths:
-        try:
-            return ImageFont.truetype(p, size)
-        except (OSError, IOError):
-            continue
-    return ImageFont.load_default()
-
-
-def _clip(text: str, font, max_w: int) -> str:
-    if font.getlength(text) <= max_w:
-        return text
-    while len(text) > 1 and font.getlength(text + "...") > max_w:
-        text = text[:-1]
-    return text + "..."
-
 
 def _round_label(max_round: int, current_round: int) -> str:
     diff = max_round - current_round
@@ -99,37 +28,62 @@ def _round_label(max_round: int, current_round: int) -> str:
     return f"Раунд {current_round}"
 
 
+def _team_name(team_id: int, team_map: dict, winner_id: int = 0) -> str:
+    """Возвращает отображаемое имя команды с форматированием."""
+    if not team_id:
+        return "TBD"
+
+    team = team_map.get(team_id)
+    if not team:
+        return "???"
+
+    name = team.get("name", "???")
+    seed = team.get("seed", 0)
+
+    # Добавляем посев (seed), если есть
+    display = f"{seed}. {name}" if seed and seed > 0 else name
+
+    has_winner = bool(winner_id)
+
+    if winner_id and winner_id == team_id:
+        # Победитель
+        return f"**{display}**"
+    elif has_winner:
+        # Проигравший
+        return f"~~{display}~~"
+    else:
+        return display
+
+
+def _match_status_emoji(status: str) -> str:
+    if status == "playing":
+        return "⚔️"
+    elif status == "completed":
+        return "✅"
+    return "⏳"
+
+
+def _clip(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+
 # ---------------------------------------------------------------------------
-# Главная функция — генерация сетки с матчами
+# Главная функция — генерация текстовой сетки с матчами
 # ---------------------------------------------------------------------------
 
 def generate_bracket(
     teams: list[dict],
     matches: list[dict],
     tournament_name: str = "Турнир",
-) -> BytesIO:
-    """Генерирует PNG турнирной сетки Single Elimination."""
+) -> str:
+    """Генерирует текстовую турнирную сетку Single Elimination."""
     if not matches:
         return generate_bracket_simple(teams, tournament_name)
 
     team_map = {t["id"]: t for t in teams}
     max_round = max(m["round"] for m in matches)
-
-    # --- Автомасштабирование ---
-    approved_count = len(teams)
-    s = _calc_scale(approved_count)
-
-    BOX_W = int(BASE_BOX_W * s)
-    TEAM_H = int(BASE_TEAM_H * s)
-    MATCH_GAP_V = int(BASE_MATCH_GAP_V * s)
-    ROUND_GAP = int(BASE_ROUND_GAP * s)
-    MARGIN_X = int(BASE_MARGIN_X * s)
-    MARGIN_Y = int(BASE_MARGIN_Y * s)
-    FONT_SZ = max(8, int(BASE_FONT * s))
-    TITLE_SZ = max(11, int(BASE_TITLE_FONT * s))
-    ROUND_SZ = max(7, int(BASE_ROUND_FONT * s))
-
-    match_h = TEAM_H * 2  # высота одного матча (2 слота)
 
     # Группируем матчи по раундам
     rounds: dict[int, list[dict]] = {}
@@ -138,235 +92,83 @@ def generate_bracket(
     for r in rounds:
         rounds[r].sort(key=lambda m: m["match_index"])
 
-    # --- Вычисляем позиции матчей ---
-    # Позиция каждого матча: (center_y, left_x)
-    # center_y — вертикальный центр матча
-    # left_x — левый край бокса
+    # --- Вычисляем ширину имён команд ---
+    max_name_len = 14  # минимум
+    for m in matches:
+        for slot in ("team1_id", "team2_id"):
+            tid = m.get(slot, 0)
+            if tid and tid in team_map:
+                name = team_map[tid].get("name", "")
+                seed = team_map[tid].get("seed", 0)
+                display = f"{seed}. {name}" if seed and seed > 0 else name
+                max_name_len = max(max_name_len, len(display) + 4)  # запас на форматирование
 
-    match_cy: dict[int, float] = {}  # match_id -> center_y
-    match_lx: dict[int, int] = {}    # match_id -> left_x
+    max_name_len = min(max_name_len, 28)  # ограничение для Discord
 
-    # Раунд 1: равномерно с зазорами
-    r1_matches = rounds.get(1, [])
-    for idx, m in enumerate(r1_matches):
-        cy = MARGIN_Y + idx * (match_h + MATCH_GAP_V) + match_h / 2
-        match_cy[m["id"]] = cy
-        match_lx[m["id"]] = MARGIN_X
+    # --- Строим текст ---
+    lines: list[str] = []
 
-    # Раунды 2+: центр между двумя фидерами
-    for rnd in range(2, max_round + 1):
-        lx = MARGIN_X + (rnd - 1) * (BOX_W + ROUND_GAP)
-        prev = rounds.get(rnd - 1, [])
-        cur = rounds.get(rnd, [])
-        for idx, m in enumerate(cur):
-            # Фидеры — матчи 2*idx и 2*idx+1 из предыдущего раунда
-            i1, i2 = idx * 2, idx * 2 + 1
-            if i1 < len(prev) and i2 < len(prev):
-                cy = (match_cy[prev[i1]["id"]] + match_cy[prev[i2]["id"]]) / 2
-            elif i1 < len(prev):
-                cy = match_cy[prev[i1]["id"]]
-            else:
-                cy = MARGIN_Y + idx * (match_h + MATCH_GAP_V) * 2 + match_h / 2
-            match_cy[m["id"]] = cy
-            match_lx[m["id"]] = lx
+    # Заголовок
+    lines.append(f"🏆 {tournament_name}")
+    lines.append("")
 
-    # --- Размеры изображения ---
-    rightmost_x = MARGIN_X + max_round * (BOX_W + ROUND_GAP) - ROUND_GAP + BOX_W
-    all_cy = list(match_cy.values())
-    min_cy = min(all_cy) if all_cy else MARGIN_Y
-    max_cy = max(all_cy) if all_cy else MARGIN_Y
-    img_w = rightmost_x + MARGIN_X
-    img_h = int(max_cy + match_h / 2 + MARGIN_Y)
-    img_h = max(img_h, 160)
-
-    # Место для заголовка
-    title_h = int(TITLE_SZ * 2.2)
-    img_h += title_h
-    # Сдвигаем все Y вниз на title_h
-    for mid in match_cy:
-        match_cy[mid] += title_h
-
-    img = Image.new("RGB", (img_w, img_h), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-    font = _font(FONT_SZ)
-    font_bold = _font(FONT_SZ, bold=True)
-    title_font = _font(TITLE_SZ, bold=True)
-    round_font = _font(ROUND_SZ, bold=True)
-
-    # --- Заголовок ---
-    draw.text((MARGIN_X, int(title_h * 0.3)), tournament_name, fill=TITLE_COLOR, font=title_font)
-
-    # --- Метки раундов ---
+    # Для каждого раунда выводим матчи
     for rnd in range(1, max_round + 1):
-        first = rounds.get(rnd, [])[0] if rounds.get(rnd) else None
-        if not first:
+        round_matches = rounds.get(rnd, [])
+        if not round_matches:
             continue
-        lx = match_lx[first["id"]]
+
         label = _round_label(max_round, rnd)
-        draw.text((lx, int(title_h * 0.3) + TITLE_SZ + 4), label, fill=ROUND_LABEL_COLOR, font=round_font)
+        lines.append(f"── {label} {'─' * max(1, 40 - len(label) - 4)}")
 
-    # --- Соединительные линии ---
-    for rnd in range(1, max_round):
-        cur = rounds.get(rnd, [])
-        nxt = rounds.get(rnd + 1, [])
-        for m in cur:
-            ni = m["match_index"] // 2
-            if ni >= len(nxt):
-                continue
-
-            # Выход: правый центр текущего матча
-            out_x = match_lx[m["id"]] + BOX_W
-            out_y = int(match_cy[m["id"]])
-
-            # Вход: левая сторона следующего матча, нужный слот
-            nm = nxt[ni]
-            in_x = match_lx[nm["id"]]
-            # Если match_index чётный → team1 (верхний слот), иначе team2 (нижний слот)
-            if m["match_index"] % 2 == 0:
-                in_y = int(match_cy[nm["id"]]) - TEAM_H // 2
-            else:
-                in_y = int(match_cy[nm["id"]]) + TEAM_H // 2
-
-            # Рисуем Z-образную линию:
-            # горизонталь вправо → вертикаль к нужному Y → горизонталь до входа
-            mid_x = out_x + ROUND_GAP // 2
-
-            line_w = max(1, int(1.5 * s))
-            draw.line([(out_x, out_y), (mid_x, out_y)], fill=LINE_COLOR, width=line_w)
-            draw.line([(mid_x, out_y), (mid_x, in_y)], fill=LINE_COLOR, width=line_w)
-            draw.line([(mid_x, in_y), (in_x, in_y)], fill=LINE_COLOR, width=line_w)
-
-    # --- Боксы матчей ---
-    for rnd in range(1, max_round + 1):
-        for m in rounds.get(rnd, []):
-            cx = match_lx[m["id"]]
-            cy = match_cy[m["id"]]
-            ty = int(cy - match_h / 2)  # верхний край матча
-
-            # Стиль рамки по статусу
-            border = BOX_BORDER
-            if m.get("status") == "playing":
-                border = BOX_BORDER_PLAYING
-            elif m.get("status") == "completed":
-                border = BOX_BORDER_COMPLETED
-
+        for m in round_matches:
+            t1_id = m.get("team1_id", 0)
+            t2_id = m.get("team2_id", 0)
             winner_id = m.get("winner_id", 0) or 0
+            status = m.get("status", "pending")
+            score = m.get("score", "") or ""
+            match_num = m.get("match_index", 0) + 1
 
-            # Рисуем весь бокс матча (контур)
-            draw.rectangle(
-                [cx, ty, cx + BOX_W, ty + match_h],
-                fill=BOX_BG, outline=border, width=max(1, int(1.5 * s)),
-            )
+            t1_name = _team_name(t1_id, team_map, winner_id)
+            t2_name = _team_name(t2_id, team_map, winner_id)
 
-            # Разделитель между слотами
-            draw.line(
-                [(cx, ty + TEAM_H), (cx + BOX_W, ty + TEAM_H)],
-                fill=DIVIDER_COLOR, width=1,
-            )
+            # Обрезаем имена
+            t1_display = _clip(t1_name, max_name_len)
+            t2_display = _clip(t2_name, max_name_len)
 
-            # Team 1 (верхний слот)
-            _draw_team_slot(
-                draw, cx, ty, BOX_W, TEAM_H,
-                m.get("team1_id", 0), team_map,
-                winner_id, border, m.get("score"),
-                font, font_bold, s,
-            )
+            emoji = _match_status_emoji(status)
 
-            # Team 2 (нижний слот)
-            _draw_team_slot(
-                draw, cx, ty + TEAM_H, BOX_W, TEAM_H,
-                m.get("team2_id", 0), team_map,
-                winner_id, border, None,
-                font, font_bold, s,
-            )
+            # Если Bye (одна команда без соперника)
+            if t1_id and not t2_id:
+                t1_display = _clip(t1_name, max_name_len)
+                lines.append(f"  М{match_num:<2} {t1_display:<{max_name_len}}  (bye)  {emoji}")
+            elif not t1_id and t2_id:
+                t2_display = _clip(t2_name, max_name_len)
+                lines.append(f"  М{match_num:<2} {t2_display:<{max_name_len}}  (bye)  {emoji}")
+            else:
+                # Обычный матч
+                score_str = f"  {score}" if score else ""
+                lines.append(
+                    f"  М{match_num:<2} {t1_display:<{max_name_len}}  vs  "
+                    f"{t2_display:<{max_name_len}}  {emoji}{score_str}"
+                )
 
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+        lines.append("")
 
+    # --- Итог: чемпион ---
+    final_matches = rounds.get(max_round, [])
+    if final_matches:
+        fm = final_matches[0]
+        if fm.get("winner_id") and fm["winner_id"] in team_map:
+            champ = team_map[fm["winner_id"]]
+            lines.append(f"🏆 Чемпион: **{champ.get('name', '???')}**")
 
-# ---------------------------------------------------------------------------
-# Отрисовка одного слота команды внутри матча
-# ---------------------------------------------------------------------------
+    # Ограничиваем длину для Discord (embed description limit ~4096)
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3890] + "\n..."
 
-def _draw_team_slot(
-    draw: ImageDraw.Draw,
-    x: int, y: int, w: int, h: int,
-    team_id: int,
-    team_map: dict,
-    winner_id: int,
-    match_border: tuple,
-    score: str | None,
-    font, font_bold, s: float,
-) -> None:
-    is_winner = bool(winner_id and winner_id == team_id)
-    is_bye = not team_id
-    has_winner = bool(winner_id)
-
-    # Фон слота
-    if is_bye:
-        draw.rectangle([x + 1, y + 1, x + w - 1, y + h - 1], fill=BOX_BG_BYE)
-    elif is_winner:
-        draw.rectangle([x + 1, y + 1, x + w - 1, y + h - 1], fill=BOX_BG_WINNER)
-    elif has_winner:
-        draw.rectangle([x + 1, y + 1, x + w - 1, y + h - 1], fill=BOX_BG_LOSER)
-
-    # Определяем текст и стиль
-    if is_bye:
-        name = "TBD"
-        txt_color = TBD_COLOR
-        uf = font
-    elif is_winner:
-        name = team_map[team_id].get("name", "???") if team_id in team_map else "???"
-        txt_color = WINNER_COLOR
-        uf = font_bold
-    else:
-        name = team_map[team_id].get("name", "???") if team_id in team_map else "???"
-        txt_color = TEXT_COLOR if not has_winner else LOSER_COLOR
-        uf = font
-
-    # Сид (seed)
-    seed_str = ""
-    if team_id and team_id in team_map:
-        seed = team_map[team_id].get("seed", 0)
-        if seed and seed > 0:
-            seed_str = str(seed)
-
-    # Отступы
-    pad_x = int(6 * s)
-    # Вычисляем pad_y исходя из высоты текста
-    try:
-        bbox = font.getbbox("Ay")
-        text_h = bbox[3] - bbox[1]
-    except Exception:
-        text_h = int(12 * s)
-    pad_y = max(1, (h - text_h) // 2)
-
-    # Рисуем сид
-    if seed_str:
-        sw = int(font.getlength(seed_str))
-        seed_x = x + pad_x
-        draw.text((seed_x, y + pad_y), seed_str, fill=SEED_COLOR, font=font)
-        name_x = seed_x + sw + int(4 * s)
-    else:
-        name_x = x + pad_x
-
-    # Имя команды (с обрезкой)
-    score_area = int(40 * s) if score else int(10 * s)
-    max_name_w = w - (name_x - x) - score_area
-    display = _clip(name, uf, max_name_w)
-    draw.text((name_x, y + pad_y), display, fill=txt_color, font=uf)
-
-    # Счёт
-    if score and not is_bye:
-        score_x = x + w - int(36 * s)
-        draw.text((score_x, y + pad_y), score, fill=SCORE_COLOR, font=font)
-
-    # Зелёная полоска слева для победителя
-    if is_winner:
-        bar_w = max(2, int(3 * s))
-        draw.rectangle([x, y, x + bar_w, y + h], fill=WINNER_COLOR)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -376,29 +178,19 @@ def _draw_team_slot(
 def generate_bracket_simple(
     teams: list[dict],
     tournament_name: str = "Турнир",
-) -> BytesIO:
+) -> str:
     """Превью сетки — показывает посев команд как в турнирной сетке."""
-    f = _font(BASE_FONT)
-    fb = _font(BASE_FONT, bold=True)
-    ft = _font(BASE_TITLE_FONT, bold=True)
-    fn = _font(10, bold=True)
-
     if not teams:
-        img = Image.new("RGB", (350, 100), BG_COLOR)
-        d = ImageDraw.Draw(img)
-        d.text((BASE_MARGIN_X, 8), tournament_name, fill=TITLE_COLOR, font=ft)
-        d.text((BASE_MARGIN_X, 40), "Пока нет команд", fill=TBD_COLOR, font=f)
-        buf = BytesIO(); img.save(buf, "PNG"); buf.seek(0); return buf
+        return f"🏆 {tournament_name}\n\nПока нет команд"
 
     approved = [t for t in teams if t.get("approved")]
     if not approved:
-        img = Image.new("RGB", (350, 100), BG_COLOR)
-        d = ImageDraw.Draw(img)
-        d.text((BASE_MARGIN_X, 8), tournament_name, fill=TITLE_COLOR, font=ft)
-        d.text((BASE_MARGIN_X, 40), "Нет одобренных команд", fill=TBD_COLOR, font=f)
-        buf = BytesIO(); img.save(buf, "PNG"); buf.seek(0); return buf
+        return f"🏆 {tournament_name}\n\nНет одобренных команд"
 
-    # Генерируем сетку-превью: показываем как команды распределены в 1-м раунде
+    lines: list[str] = []
+    lines.append(f"🏆 {tournament_name}")
+    lines.append("")
+
     n = len(approved)
     bracket_size = 1
     while bracket_size < n:
@@ -408,25 +200,7 @@ def generate_bracket_simple(
     first_round_matches = bracket_size // 2
     byes = bracket_size - n
 
-    s = _calc_scale(n)
-    BOX_W = int(BASE_BOX_W * s)
-    TEAM_H = int(BASE_TEAM_H * s)
-    MATCH_GAP_V = int(BASE_MATCH_GAP_V * s)
-    ROUND_GAP = int(BASE_ROUND_GAP * s)
-    MARGIN_X = int(BASE_MARGIN_X * s)
-    MARGIN_Y = int(BASE_MARGIN_Y * s)
-    FONT_SZ = max(8, int(BASE_FONT * s))
-    TITLE_SZ = max(11, int(BASE_TITLE_FONT * s))
-    ROUND_SZ = max(7, int(BASE_ROUND_FONT * s))
-
-    font = _font(FONT_SZ)
-    font_bold = _font(FONT_SZ, bold=True)
-    title_font = _font(TITLE_SZ, bold=True)
-    round_font = _font(ROUND_SZ, bold=True)
-
-    match_h = TEAM_H * 2
-
-    # Seeding: 1v8, 4v5, 3v6, 2v7 (standard bracket seeding)
+    # Seeding
     seeded = list(approved)
     seeded = _standard_seed_order(seeded)
 
@@ -450,187 +224,55 @@ def generate_bracket_simple(
                 team_idx += 1
         r1_matchups.append((t1, t2))
 
-    # Вычисляем позиции матчей для всей сетки
-    # (даже для пустых раундов, чтобы нарисовать линии)
-    match_cy: list[list[float]] = []  # match_cy[round-1][match_index] = center_y
-    match_lx_list: list[int] = []
+    # --- Ширина ---
+    max_name_len = 14
+    for t in approved:
+        seed = t.get("seed", 0)
+        display = f"{seed}. {t['name']}" if seed and seed > 0 else t["name"]
+        max_name_len = max(max_name_len, len(display) + 2)
+    max_name_len = min(max_name_len, 28)
 
-    # Раунд 1
-    r1_cy = []
-    for idx in range(first_round_matches):
-        cy = MARGIN_Y + idx * (match_h + MATCH_GAP_V) + match_h / 2
-        r1_cy.append(cy)
-    match_cy.append(r1_cy)
-    match_lx_list.append(MARGIN_X)
+    # Выводим первый раунд
+    label = _round_label(num_rounds, 1)
+    lines.append(f"── {label} {'─' * max(1, 40 - len(label) - 4)}")
 
-    # Раунды 2+
+    for idx, (t1, t2) in enumerate(r1_matchups):
+        match_num = idx + 1
+        if t1 and not t2:
+            name1 = _clip(t1.get("name", "???"), max_name_len)
+            lines.append(f"  М{match_num:<2} {name1:<{max_name_len}}  (bye)")
+        elif t1 and t2:
+            name1 = _clip(t1.get("name", "???"), max_name_len)
+            name2 = _clip(t2.get("name", "???"), max_name_len)
+            lines.append(f"  М{match_num:<2} {name1:<{max_name_len}}  vs  {name2:<{max_name_len}}")
+        elif t1:
+            name1 = _clip(t1.get("name", "???"), max_name_len)
+            lines.append(f"  М{match_num:<2} {name1:<{max_name_len}}  (bye)")
+
+    lines.append("")
+
+    # Показываем структуру следующих раундов
     for rnd in range(2, num_rounds + 1):
         matches_in_round = bracket_size // (2 ** rnd)
-        lx = MARGIN_X + (rnd - 1) * (BOX_W + ROUND_GAP)
-        prev_cy = match_cy[rnd - 2]
-        cur_cy = []
-        for idx in range(matches_in_round):
-            i1, i2 = idx * 2, idx * 2 + 1
-            if i1 < len(prev_cy) and i2 < len(prev_cy):
-                cy = (prev_cy[i1] + prev_cy[i2]) / 2
-            elif i1 < len(prev_cy):
-                cy = prev_cy[i1]
-            else:
-                cy = MARGIN_Y + idx * (match_h + MATCH_GAP_V) * 2 + match_h / 2
-            cur_cy.append(cy)
-        match_cy.append(cur_cy)
-        match_lx_list.append(lx)
-
-    # Размеры изображения
-    rightmost_x = MARGIN_X + num_rounds * (BOX_W + ROUND_GAP) - ROUND_GAP + BOX_W
-    all_cy = [cy for rnd_cy in match_cy for cy in rnd_cy]
-    max_cy = max(all_cy) if all_cy else MARGIN_Y
-    img_w = rightmost_x + MARGIN_X
-    img_h = int(max_cy + match_h / 2 + MARGIN_Y)
-    img_h = max(img_h, 160)
-
-    title_h = int(TITLE_SZ * 2.2)
-    img_h += title_h
-    # Сдвигаем все Y вниз
-    for rnd_idx in range(len(match_cy)):
-        match_cy[rnd_idx] = [cy + title_h for cy in match_cy[rnd_idx]]
-
-    img = Image.new("RGB", (img_w, img_h), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    # Заголовок
-    draw.text((MARGIN_X, int(title_h * 0.3)), tournament_name, fill=TITLE_COLOR, font=title_font)
-
-    # Метки раундов
-    for rnd in range(1, num_rounds + 1):
-        lx = match_lx_list[rnd - 1]
         label = _round_label(num_rounds, rnd)
-        draw.text((lx, int(title_h * 0.3) + TITLE_SZ + 4), label, fill=ROUND_LABEL_COLOR, font=round_font)
+        lines.append(f"── {label} {'─' * max(1, 40 - len(label) - 4)}")
+        for idx in range(matches_in_round):
+            match_num = idx + 1
+            prev1 = idx * 2 + 1
+            prev2 = idx * 2 + 2
+            lines.append(f"  М{match_num:<2} Победитель М{prev1}  vs  Победитель М{prev2}")
+        lines.append("")
 
-    # Соединительные линии
-    for rnd in range(1, num_rounds):
-        prev_cy = match_cy[rnd - 1]
-        cur_cy = match_cy[rnd]
-        prev_lx = match_lx_list[rnd - 1]
-        cur_lx = match_lx_list[rnd]
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3890] + "\n..."
 
-        for idx, cy in enumerate(prev_cy):
-            ni = idx // 2
-            if ni >= len(cur_cy):
-                continue
-
-            out_x = prev_lx + BOX_W
-            out_y = int(cy)
-
-            ncy = cur_cy[ni]
-            if idx % 2 == 0:
-                in_y = int(ncy) - TEAM_H // 2
-            else:
-                in_y = int(ncy) + TEAM_H // 2
-            in_x = cur_lx
-
-            mid_x = out_x + ROUND_GAP // 2
-            line_w = max(1, int(1.5 * s))
-            draw.line([(out_x, out_y), (mid_x, out_y)], fill=LINE_COLOR, width=line_w)
-            draw.line([(mid_x, out_y), (mid_x, in_y)], fill=LINE_COLOR, width=line_w)
-            draw.line([(mid_x, in_y), (in_x, in_y)], fill=LINE_COLOR, width=line_w)
-
-    # Боксы матчей первого раунда (с командами)
-    for idx, (t1, t2) in enumerate(r1_matchups):
-        cx = match_lx_list[0]
-        cy = match_cy[0][idx]
-        ty = int(cy - match_h / 2)
-
-        # Рамка
-        draw.rectangle(
-            [cx, ty, cx + BOX_W, ty + match_h],
-            fill=BOX_BG, outline=BOX_BORDER, width=max(1, int(1.5 * s)),
-        )
-        # Разделитель
-        draw.line(
-            [(cx, ty + TEAM_H), (cx + BOX_W, ty + TEAM_H)],
-            fill=DIVIDER_COLOR, width=1,
-        )
-
-        # Team 1
-        if t1:
-            _draw_team_slot(
-                draw, cx, ty, BOX_W, TEAM_H,
-                t1["id"], {t["id"]: t for t in approved},
-                0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-        else:
-            _draw_team_slot(
-                draw, cx, ty, BOX_W, TEAM_H,
-                0, {}, 0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-
-        # Team 2
-        if t2:
-            _draw_team_slot(
-                draw, cx, ty + TEAM_H, BOX_W, TEAM_H,
-                t2["id"], {t["id"]: t for t in approved},
-                0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-        else:
-            # Bye или TBD
-            _draw_team_slot(
-                draw, cx, ty + TEAM_H, BOX_W, TEAM_H,
-                0, {}, 0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-
-    # Пустые боксы для раундов 2+
-    for rnd in range(2, num_rounds + 1):
-        lx = match_lx_list[rnd - 1]
-        for cy in match_cy[rnd - 1]:
-            ty = int(cy - match_h / 2)
-            draw.rectangle(
-                [lx, ty, lx + BOX_W, ty + match_h],
-                fill=BOX_BG, outline=BOX_BORDER, width=max(1, int(1.5 * s)),
-            )
-            draw.line(
-                [(lx, ty + TEAM_H), (lx + BOX_W, ty + TEAM_H)],
-                fill=DIVIDER_COLOR, width=1,
-            )
-            # TBD слоты
-            _draw_team_slot(
-                draw, lx, ty, BOX_W, TEAM_H,
-                0, {}, 0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-            _draw_team_slot(
-                draw, lx, ty + TEAM_H, BOX_W, TEAM_H,
-                0, {}, 0, BOX_BORDER, None,
-                font, font_bold, s,
-            )
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    return text
 
 
 # ---------------------------------------------------------------------------
-# Хелперы
+# Хелперы посева
 # ---------------------------------------------------------------------------
-
-def _calc_scale(num_teams: int) -> float:
-    """Вычисляет масштаб в зависимости от количества команд."""
-    if num_teams <= 4:
-        return 1.0
-    elif num_teams <= 8:
-        return 0.92
-    elif num_teams <= 16:
-        return 0.82
-    elif num_teams <= 32:
-        return 0.7
-    else:
-        return 0.6
-
 
 def _standard_seed_order(teams: list[dict]) -> list[dict]:
     """
@@ -646,9 +288,7 @@ def _standard_seed_order(teams: list[dict]) -> list[dict]:
     while bracket_size < n:
         bracket_size *= 2
 
-    # Генерируем стандартный порядок посева
     order = _seed_positions(bracket_size)
-    # Обрезаем до количества команд и мапим
     result = [None] * n
     pos = 0
     for seed_pos in order:
@@ -656,7 +296,7 @@ def _standard_seed_order(teams: list[dict]) -> list[dict]:
             result[seed_pos] = teams[pos]
             pos += 1
 
-    # Заполняем None (если алгоритм не покрыл все позиции)
+    # Заполняем None
     final = []
     used = set()
     for item in result:
@@ -680,7 +320,6 @@ def _seed_positions(size: int) -> list[int]:
     if size == 2:
         return [0, 1]
 
-    # Рекурсивно строим посев
     half = size // 2
     sub = _seed_positions(half)
     result = []

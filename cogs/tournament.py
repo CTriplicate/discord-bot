@@ -31,7 +31,6 @@ import json
 import math
 import random
 import re
-from io import BytesIO
 
 import discord
 from discord import app_commands
@@ -39,7 +38,7 @@ from discord.ext import commands
 
 import database as db
 import config
-from utils.bracket import generate_bracket, generate_bracket_simple
+from utils.bracket import generate_bracket, generate_bracket_simple  # noqa: F401 — generate_bracket_simple используется в generate_bracket
 
 
 # ===========================================================================
@@ -722,11 +721,10 @@ class RefreshButton(discord.ui.Button):
         tournament = await db.tournament_get(self.tournament_id)
         if not tournament:
             return
-        embed, file, view = await _build_bracket_panel(self.tournament_id, tournament)
+        embed, view = await _build_bracket_panel(self.tournament_id, tournament)
         await interaction.followup.edit_message(
             message_id=interaction.message.id,
             embed=embed,
-            attachments=[file],
             view=view,
         )
 
@@ -1517,22 +1515,20 @@ async def _build_closed_panel(tournament_id: int, tournament: dict, fmt: str, ma
 
 
 async def _build_bracket_panel(tournament_id: int, tournament: dict, fmt: str) -> tuple:
-    """Собирает embed + file + view для этапа BRACKET / FINISHED."""
+    """Собирает embed + view для этапа BRACKET / FINISHED."""
     teams = await db.team_list(tournament_id)
     matches = await db.match_list(tournament_id)
 
     if matches:
-        buf = generate_bracket(teams, matches, tournament["name"])
+        bracket_text = generate_bracket(teams, matches, tournament["name"])
     else:
-        buf = generate_bracket_simple(teams, tournament["name"])
-
-    file = discord.File(buf, filename="bracket.png")
+        bracket_text = generate_bracket_simple(teams, tournament["name"])
 
     status_emoji = {"bracket": "⚔️", "finished": "🏆"}.get(tournament["status"], "❓")
     status_text = {"bracket": "Идёт", "finished": "Завершён"}.get(tournament["status"], tournament["status"])
 
     embed = discord.Embed(title=f"🏆 {tournament['name']}", color=config.EMBED_COLOR)
-    embed.set_image(url="attachment://bracket.png")
+    embed.description = bracket_text
     embed.add_field(name="Формат", value=fmt, inline=True)
     embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
 
@@ -1553,7 +1549,7 @@ async def _build_bracket_panel(tournament_id: int, tournament: dict, fmt: str) -
     else:
         view = BracketView(tournament_id)
 
-    return (embed, file, view)
+    return (embed, view)
 
 
 async def _update_panel_by_tournament(client: discord.Client, tournament_id: int) -> None:
@@ -1578,14 +1574,9 @@ async def _update_panel_by_tournament(client: discord.Client, tournament_id: int
 
     status = tournament["status"]
 
-    if status == "open" or status == "closed":
-        result = await _build_panel(tournament_id, tournament)
-        embed, view = result[0], result[1]
-        await message.edit(embed=embed, view=view)
-    elif status in ("bracket", "finished"):
-        result = await _build_panel(tournament_id, tournament)
-        embed, file, view = result[0], result[1], result[2]
-        await message.edit(embed=embed, attachments=[file], view=view)
+    result = await _build_panel(tournament_id, tournament)
+    embed, view = result[0], result[1]
+    await message.edit(embed=embed, view=view)
 
 
 # ===========================================================================
@@ -1702,17 +1693,15 @@ class TournamentCog(commands.Cog, name="Tournament"):
             matches = await db.match_list(tid)
 
             if matches:
-                buf = generate_bracket(teams, matches, t["name"])
+                bracket_text = generate_bracket(teams, matches, t["name"])
             else:
-                buf = generate_bracket_simple(teams, t["name"])
-
-            file = discord.File(buf, filename="bracket.png")
+                bracket_text = generate_bracket_simple(teams, t["name"])
 
             status_emoji = {"bracket": "⚔️", "finished": "🏆"}.get(t["status"], "❓")
             status_text = {"bracket": "Идёт", "finished": "Завершён"}.get(t["status"], t["status"])
 
             embed = discord.Embed(title=f"🏆 {t['name']}", color=config.EMBED_COLOR)
-            embed.set_image(url="attachment://bracket.png")
+            embed.description = bracket_text
             embed.add_field(name="Формат", value=fmt, inline=True)
             embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
 
@@ -1740,7 +1729,7 @@ class TournamentCog(commands.Cog, name="Tournament"):
                             inline=False,
                         )
 
-            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         elif t["status"] in ("open", "closed"):
             teams = await db.team_list(tid)
@@ -1751,8 +1740,7 @@ class TournamentCog(commands.Cog, name="Tournament"):
                 )
                 return
 
-            buf = generate_bracket_simple(teams, t["name"])
-            file = discord.File(buf, filename="bracket.png")
+            bracket_text = generate_bracket_simple(teams, t["name"])
 
             status_emoji = {"open": "🟢", "closed": "🔒"}.get(t["status"], "❓")
             status_text = {"open": "Регистрация открыта", "closed": "Набор закрыт"}.get(
@@ -1760,14 +1748,14 @@ class TournamentCog(commands.Cog, name="Tournament"):
             )
 
             embed = discord.Embed(title=f"🏆 {t['name']}", color=config.EMBED_COLOR)
-            embed.set_image(url="attachment://bracket.png")
+            embed.description = bracket_text
             embed.add_field(name="Формат", value=fmt, inline=True)
             embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
 
             approved = sum(1 for tm in teams if tm.get("approved"))
             embed.add_field(name="Команд", value=f"{len(teams)} (✅ {approved})", inline=True)
 
-            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # -----------------------------------------------------------------------
     # /tournament — группа команд администратора

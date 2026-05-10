@@ -1,23 +1,35 @@
 """
-Модуль Tournament — создание турниров, команд, анкет, сетки и матчей.
+Модуль Tournament — система турниров с анкетами и кнопочным управлением.
 
-Команды:
-  /createlobby   — создание турнира/группы (1v1, 2v2, 3v3, командное ДМ, и т.д.)
-  /lobbylist     — список всех команд + картинка сетки (с кнопкой «Обновить»)
-  /deleteteam    — удаление команды
-  /setwinner     — установить победителя матча
-  /startmatch    — запуск матча
+Регистрация (для участников):
+  /1vs1           — записаться на 1v1 турнир
+  /2vs2           — записаться на 2v2 турнир
+  /3vs3           — записаться на 3v3 турнир
+  /customlobby    — записаться на кастомный турнир (4v4 и больше)
 
-Дополнительные (вспомогательные):
-  /joinlobby     — присоединиться к турниру (заполнить анкету)
-  /approveteam   — одобрить команду
-  /generatebracket — сгенерировать сетку турнира
+Управление (для администрации):
+  /tournament create            — создать турнир
+  /tournament questions add     — добавить вопрос в анкету
+  /tournament questions remove  — удалить вопрос из анкеты
+  /tournament questions list    — список вопросов
+  /tournament questions clear   — очистить все вопросы
+  /tournament list              — список турниров сервера
+  /tournament panel             — показать интерактивную панель
+  /tournament delete            — удалить турнир
+
+Панель турнира — одно сообщение с кнопками, обновляется по этапам:
+  OPEN    → [📝 Записаться] [📋 Команды] [⚙️ Управление]
+  CLOSED  → [⚙️ Управление] (генерация сетки / удаление)
+  BRACKET → [🔄 Обновить] [⚔️ Запустить] [🏆 Победитель]
+  FINISHED → автоматически после финального матча
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
+import math
+import random
+import re
 from io import BytesIO
 
 import discord
@@ -29,163 +41,1030 @@ import config
 from utils.bracket import generate_bracket, generate_bracket_simple
 
 
-# ---------------------------------------------------------------------------
-# Кнопка «Обновить» для lobbylist
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HELPERS
+# ===========================================================================
 
-class RefreshBracketButton(discord.ui.Button):
+async def _is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    user_roles = {r.name for r in interaction.user.roles}
+    return bool(user_roles & set(config.ADMIN_ROLES))
+
+
+def _round_name(max_round: int, current_round: int) -> str:
+    diff = max_round - current_round
+    if diff == 0:
+        return "Финал"
+    if diff == 1:
+        return "Полуфинал"
+    if diff == 2:
+        return "Четвертьфинал"
+    return f"Раунд {current_round}"
+
+
+def _format_str(team_size: int, is_team_dm: bool = False) -> str:
+    if team_size == 1:
+        return "1v1"
+    s = f"{team_size}v{team_size}"
+    if is_team_dm:
+        s += " (Командное ДМ)"
+    return s
+
+
+# ===========================================================================
+# МОДАЛКА РЕГИСТРАЦИИ
+# ===========================================================================
+
+class RegisterModal(discord.ui.Modal, title="Регистрация на турнир"):
+    """Модалка регистрации: название, участники, ответы на анкету."""
+
+    def __init__(
+        self,
+        tournament_id: int,
+        team_size: int,
+        questions: list[dict],
+        channel_id: int,
+        panel_message_id: int,
+    ) -> None:
+        super().__init__()
+        self.tournament_id = tournament_id
+        self.team_size = team_size
+        self.questions = questions
+        self.channel_id = channel_id
+        self.panel_message_id = panel_message_id
+
+        # --- Поле «Название команды» ---
+        if team_size > 1:
+            self.add_item(discord.ui.TextInput(
+                label="Название команды",
+                placeholder="Введите название вашей команды",
+                max_length=50,
+                required=True,
+                custom_id="team_name",
+            ))
+        else:
+            self.add_item(discord.ui.TextInput(
+                label="Никнейм (или оставьте пустым)",
+                placeholder="Будет использовано ваше имя в Discord",
+                max_length=50,
+                required=False,
+                custom_id="team_name",
+            ))
+
+        # --- Поле «Участники» — только для командных турниров ---
+        if team_size > 1:
+            needed = team_size - 1
+            self.add_item(discord.ui.TextInput(
+                label=f"Участники (упомяните {needed} чел.)",
+                placeholder="@user1 @user2 @user3",
+                style=discord.TextStyle.paragraph,
+                max_length=300,
+                required=True,
+                custom_id="members",
+            ))
+
+        # --- Вопросы анкеты ---
+        max_q = 3 if team_size > 1 else 4  # Лимит полей модалки (5 шт.)
+        for i, q in enumerate(questions[:max_q]):
+            label_text = q["question_text"][:45]
+            self.add_item(discord.ui.TextInput(
+                label=label_text,
+                placeholder=q["question_text"],
+                style=discord.TextStyle.paragraph,
+                max_length=500,
+                required=bool(q.get("required", 1)),
+                custom_id=f"question_{i}",
+            ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # --- Собираем данные ---
+        team_name_raw = ""
+        members_raw = ""
+        answers: dict[str, str] = {}
+
+        for child in self.children:
+            if not isinstance(child, discord.ui.TextInput):
+                continue
+            if child.custom_id == "team_name":
+                team_name_raw = child.value.strip()
+            elif child.custom_id == "members":
+                members_raw = child.value.strip()
+            elif child.custom_id and child.custom_id.startswith("question_"):
+                answers[child.label] = child.value
+
+        # --- Проверки ---
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament or tournament["status"] != "open":
+            await interaction.response.send_message(
+                "❌ Турнир закрыт для регистрации.", ephemeral=True
+            )
+            return
+
+        existing_teams = await db.team_list(self.tournament_id)
+        if tournament["max_teams"] > 0 and len(existing_teams) >= tournament["max_teams"]:
+            await interaction.response.send_message(
+                "❌ Достигнут лимит команд.", ephemeral=True
+            )
+            return
+
+        # Проверяем, не в команде ли уже
+        for t in existing_teams:
+            member_ids = json.loads(t["members"])
+            if interaction.user.id in member_ids:
+                await interaction.response.send_message(
+                    "⚠️ Вы уже состоите в команде на этом турнире.", ephemeral=True
+                )
+                return
+
+        # --- Обработка 1v1 ---
+        if self.team_size == 1:
+            team_name = team_name_raw or interaction.user.display_name
+            tid = await db.team_create(self.tournament_id, team_name, [interaction.user.id])
+            await db.team_set_approved(tid, True)
+
+            if answers:
+                await db.application_create(
+                    self.tournament_id, interaction.user.id, team_name, answers
+                )
+
+            await interaction.response.send_message(
+                f"✅ Вы записаны как **{team_name}**!", ephemeral=True
+            )
+        else:
+            # --- Обработка командного ---
+            if not team_name_raw:
+                await interaction.response.send_message(
+                    "❌ Укажите название команды!", ephemeral=True
+                )
+                return
+
+            # Парсим участников из упоминаний
+            member_ids: list[int] = [interaction.user.id]
+            for match in re.findall(r"<@!?(\d+)>", members_raw):
+                member_ids.append(int(match))
+            member_ids = list(dict.fromkeys(member_ids))
+
+            if len(member_ids) < self.team_size:
+                await interaction.response.send_message(
+                    f"❌ Нужно {self.team_size} участников. Указано: {len(member_ids)}.",
+                    ephemeral=True,
+                )
+                return
+
+            member_ids = member_ids[:self.team_size]
+
+            # Проверяем пересечения с другими командами
+            for t in existing_teams:
+                existing_members = json.loads(t["members"])
+                overlap = set(member_ids) & set(existing_members)
+                if overlap:
+                    overlap_mentions = " ".join(f"<@{uid}>" for uid in overlap)
+                    await interaction.response.send_message(
+                        f"⚠️ {overlap_mentions} уже в команде **{t['name']}**.",
+                        ephemeral=True,
+                    )
+                    return
+
+            tid = await db.team_create(self.tournament_id, team_name_raw, member_ids)
+
+            if answers:
+                await db.application_create(
+                    self.tournament_id, interaction.user.id, team_name_raw, answers
+                )
+
+            await interaction.response.send_message(
+                f"✅ Команда **{team_name_raw}** зарегистрирована! "
+                f"Ожидайте одобрения от администрации.",
+                ephemeral=True,
+            )
+
+        # --- Обновляем панель ---
+        await _update_panel_by_tournament(interaction.client, self.tournament_id)  # type: ignore
+
+
+# ===========================================================================
+# ВЫБОР ТУРНИРА (dropdown при /1vs1, /2vs2 и т.д.)
+# ===========================================================================
+
+class TournamentSelectView(discord.ui.View):
+    """View с dropdown для выбора турнира при регистрации."""
+
+    def __init__(self, tournaments: list[dict], team_size: int) -> None:
+        super().__init__(timeout=60)
+        self.add_item(TournamentSelect(tournaments, team_size))
+
+
+class TournamentSelect(discord.ui.Select):
+    def __init__(self, tournaments: list[dict], team_size: int) -> None:
+        self.team_size = team_size
+        options = []
+        for t in tournaments[:25]:
+            fmt = _format_str(t["team_size"], t.get("is_team_dm", 0))
+            label = f"{t['name']} (#{t['id']})"
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=str(t["id"]),
+                description=f"{fmt} | Статус: {t['status']}",
+            ))
+        super().__init__(
+            placeholder="Выберите турнир...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="tournament_reg_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        tournament_id = int(self.values[0])
+        tournament = await db.tournament_get(tournament_id)
+        if not tournament or tournament["status"] != "open":
+            await interaction.response.send_message(
+                "❌ Турнир не найден или регистрация закрыта.", ephemeral=True
+            )
+            return
+
+        # Загружаем вопросы
+        questions = await db.question_list(tournament_id)
+
+        # Проверяем лимит вопросов для модалки
+        max_q = 3 if self.team_size > 1 else 4
+        if len(questions) > max_q:
+            questions = questions[:max_q]
+
+        modal = RegisterModal(
+            tournament_id=tournament_id,
+            team_size=self.team_size,
+            questions=questions,
+            channel_id=tournament.get("channel_id", 0),
+            panel_message_id=tournament.get("panel_message_id", 0),
+        )
+        await interaction.response.send_modal(modal)
+
+
+# ===========================================================================
+# КНОПКИ ПАНЕЛИ — ЭТАП OPEN (Регистрация)
+# ===========================================================================
+
+class OpenView(discord.ui.View):
+    """Панель этапа OPEN — регистрация."""
+
+    def __init__(self, tournament_id: int, team_size: int,
+                 channel_id: int, panel_message_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(JoinButton(tournament_id, team_size, channel_id, panel_message_id))
+        self.add_item(TeamsButton(tournament_id))
+        self.add_item(AdminButton(tournament_id))
+
+
+class JoinButton(discord.ui.Button):
+    """📝 Записаться — открывает выбор турнира, затем модалку."""
+
+    def __init__(self, tournament_id: int, team_size: int,
+                 channel_id: int, panel_message_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="📝 Записаться",
+            custom_id=f"tjoin:{tournament_id}",
+        )
+        self.tournament_id = tournament_id
+        self.team_size = team_size
+        self.channel_id = channel_id
+        self.panel_message_id = panel_message_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament or tournament["status"] != "open":
+            await interaction.response.send_message(
+                "❌ Набор закрыт.", ephemeral=True
+            )
+            return
+
+        questions = await db.question_list(self.tournament_id)
+        max_q = 3 if self.team_size > 1 else 4
+        if len(questions) > max_q:
+            questions = questions[:max_q]
+
+        modal = RegisterModal(
+            tournament_id=self.tournament_id,
+            team_size=self.team_size,
+            questions=questions,
+            channel_id=self.channel_id,
+            panel_message_id=self.panel_message_id,
+        )
+        await interaction.response.send_modal(modal)
+
+
+class TeamsButton(discord.ui.Button):
+    """📋 Команды — показывает список команд."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="📋 Команды",
+            custom_id=f"tteams:{tournament_id}",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        teams = await db.team_list(self.tournament_id)
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        if not teams:
+            await interaction.response.send_message(
+                "📋 Пока ни одной команды.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"📋 Команды — {tournament['name']}",
+            color=config.EMBED_COLOR,
+        )
+
+        lines: list[str] = []
+        for t in teams:
+            status = "✅" if t.get("approved") else "⏳"
+            members = json.loads(t["members"])
+            mentions = " ".join(f"<@{uid}>" for uid in members)
+            lines.append(f"{status} **{t['name']}** (#{t['id']}) — {mentions}")
+
+        embed.description = "\n".join(lines[:20])
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AdminButton(discord.ui.Button):
+    """⚙️ Управление — открывает админ-панель."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="⚙️ Управление",
+            custom_id=f"tadmin:{tournament_id}",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message(
+                "❌ Только для администрации.", ephemeral=True
+            )
+            return
+
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        if tournament["status"] == "open":
+            await _show_admin_open(interaction, self.tournament_id)
+        elif tournament["status"] == "closed":
+            await _show_admin_closed(interaction, self.tournament_id)
+        elif tournament["status"] == "bracket":
+            await _show_admin_bracket(interaction, self.tournament_id)
+        elif tournament["status"] == "finished":
+            await _show_admin_finished(interaction, self.tournament_id)
+
+
+# ===========================================================================
+# КНОПКИ ПАНЕЛИ — ЭТАП CLOSED
+# ===========================================================================
+
+class ClosedView(discord.ui.View):
+    """Панель этапа CLOSED — набор закрыт, ожидание генерации сетки."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(AdminButton(tournament_id))
+
+
+# ===========================================================================
+# КНОПКИ ПАНЕЛИ — ЭТАП BRACKET
+# ===========================================================================
+
+class BracketView(discord.ui.View):
+    """Панель этапа BRACKET — управление матчами."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(RefreshButton(tournament_id))
+        self.add_item(StartMatchButton(tournament_id))
+        self.add_item(SetWinnerButton(tournament_id))
+
+
+class RefreshButton(discord.ui.Button):
     def __init__(self, tournament_id: int) -> None:
         super().__init__(
             style=discord.ButtonStyle.secondary,
             label="🔄 Обновить",
-            custom_id=f"refresh_bracket:{tournament_id}",
+            custom_id=f"trefresh:{tournament_id}",
         )
         self.tournament_id = tournament_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        await _send_bracket(interaction, self.tournament_id, edit=True)
-
-
-class BracketView(discord.ui.View):
-    def __init__(self, tournament_id: int) -> None:
-        super().__init__(timeout=None)
-        self.add_item(RefreshBracketButton(tournament_id))
-
-
-# ---------------------------------------------------------------------------
-# Модальное окно анкеты
-# ---------------------------------------------------------------------------
-
-class ApplicationModal(discord.ui.Modal, title="Анкета для турнира"):
-    def __init__(self, tournament_id: int, criteria: str, team_name: str = "") -> None:
-        super().__init__()
-        self.tournament_id = tournament_id
-        self.criteria = criteria
-
-        # Динамически создаём поля на основе критериев
-        questions = [q.strip() for q in criteria.split("|") if q.strip()]
-        if not questions:
-            questions = ["Расскажите о себе"]
-
-        for i, q in enumerate(questions[:5]):  # Максимум 5 полей
-            self.add_item(
-                discord.ui.TextInput(
-                    label=q[:45],
-                    placeholder=q,
-                    max_length=500,
-                    required=True,
-                    custom_id=f"question_{i}",
-                )
-            )
-
-        # Имя команды (если team_size > 1)
-        self._team_name_input = None  # Будет добавлено ниже если нужно
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        answers: dict[str, str] = {}
-        for child in self.children:
-            if isinstance(child, discord.ui.TextInput) and child.custom_id and child.custom_id.startswith("question_"):
-                answers[child.label] = child.value
-
-        # Проверяем, не подавал ли уже заявку
-        existing = await db.application_list(self.tournament_id)
-        if any(a["user_id"] == interaction.user.id and a["status"] == "pending" for a in existing):
-            await interaction.response.send_message(
-                "⚠️ Вы уже подали заявку на этот турнир.", ephemeral=True
-            )
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament:
             return
-
-        app_id = await db.application_create(
-            tournament_id=self.tournament_id,
-            user_id=interaction.user.id,
-            answers=answers,
-        )
-
-        await interaction.response.send_message(
-            f"✅ Заявка #{app_id} отправлена! Ожидайте одобрения от администрации.",
-            ephemeral=True,
-        )
-
-
-class JoinLobbyButton(discord.ui.Button):
-    def __init__(self, tournament_id: int, criteria: str) -> None:
-        super().__init__(
-            style=discord.ButtonStyle.success,
-            label="📝 Подать заявку",
-            custom_id=f"join_lobby:{tournament_id}",
-        )
-        self.tournament_id = tournament_id
-        self.criteria = criteria
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        modal = ApplicationModal(self.tournament_id, self.criteria)
-        await interaction.response.send_modal(modal)
-
-
-class LobbyView(discord.ui.View):
-    def __init__(self, tournament_id: int, criteria: str) -> None:
-        super().__init__(timeout=None)
-        self.add_item(JoinLobbyButton(tournament_id, criteria))
-
-
-# ---------------------------------------------------------------------------
-# Helper: отправка картинки сетки
-# ---------------------------------------------------------------------------
-
-async def _send_bracket(
-    interaction: discord.Interaction,
-    tournament_id: int,
-    edit: bool = False,
-) -> None:
-    tournament = await db.tournament_get(tournament_id)
-    if not tournament:
-        msg = "❌ Турнир не найден."
-        if edit:
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-        return
-
-    teams = await db.team_list(tournament_id)
-    matches = await db.match_list(tournament_id)
-
-    # Генерируем картинку
-    if matches:
-        buf = generate_bracket(teams, matches, tournament["name"])
-    else:
-        buf = generate_bracket_simple(teams, tournament["name"])
-
-    file = discord.File(buf, filename="bracket.png")
-
-    embed = discord.Embed(
-        title=f"🏆 {tournament['name']}",
-        color=config.EMBED_COLOR,
-    )
-    embed.set_image(url="attachment://bracket.png")
-    embed.add_field(name="Команд", value=str(len(teams)), inline=True)
-    embed.add_field(name="Матчей", value=str(len(matches)), inline=True)
-    embed.add_field(name="Статус", value=tournament["status"], inline=True)
-
-    view = BracketView(tournament_id)
-
-    if edit:
+        embed, file, view = await _build_bracket_panel(self.tournament_id, tournament)
         await interaction.followup.edit_message(
-            message_id=interaction.message.id,  # type: ignore
+            message_id=interaction.message.id,
             embed=embed,
             attachments=[file],
             view=view,
         )
+
+
+class StartMatchButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="⚔️ Запустить",
+            custom_id=f"tstart:{tournament_id}",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
+            return
+
+        matches = await db.match_list(self.tournament_id)
+        pending = [m for m in matches if m["status"] == "pending" and m["team1_id"] and m["team2_id"]]
+
+        if not pending:
+            await interaction.response.send_message("❌ Нет матчей для запуска.", ephemeral=True)
+            return
+
+        teams = await db.team_list(self.tournament_id)
+        team_map = {t["id"]: t for t in teams}
+
+        view = MatchSelectView(pending, team_map, "start")
+        embed = discord.Embed(title="⚔️ Выберите матч для запуска", color=config.EMBED_COLOR)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class SetWinnerButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="🏆 Победитель",
+            custom_id=f"twinner:{tournament_id}",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
+            return
+
+        matches = await db.match_list(self.tournament_id)
+        playing = [m for m in matches if m["status"] == "playing"]
+
+        if not playing:
+            await interaction.response.send_message(
+                "❌ Нет матчей в процессе. Сначала запустите матч.", ephemeral=True
+            )
+            return
+
+        teams = await db.team_list(self.tournament_id)
+        team_map = {t["id"]: t for t in teams}
+
+        view = MatchSelectView(playing, team_map, "winner")
+        embed = discord.Embed(title="🏆 Выберите матч для установки победителя", color=config.EMBED_COLOR)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ===========================================================================
+# КНОПКИ ПАНЕЛИ — ЭТАП FINISHED
+# ===========================================================================
+
+class FinishedView(discord.ui.View):
+    """Панель этапа FINISHED — турнир завершён."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(AdminButton(tournament_id))
+
+
+# ===========================================================================
+# АДМИН-ПАНЕЛЬ
+# ===========================================================================
+
+class AdminOpenView(discord.ui.View):
+    """Админ-панель для этапа OPEN."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=120)
+        self.tournament_id = tournament_id
+        self.add_item(ApproveSelectButton(tournament_id))
+        self.add_item(RejectSelectButton(tournament_id))
+        self.add_item(ViewApplicationsButton(tournament_id))
+        self.add_item(CloseRegButton(tournament_id))
+        self.add_item(DeleteTournamentButton(tournament_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore
+
+
+class AdminClosedView(discord.ui.View):
+    """Админ-панель для этапа CLOSED."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=120)
+        self.add_item(GenerateBracketButton(tournament_id))
+        self.add_item(ReopenRegButton(tournament_id))
+        self.add_item(DeleteTournamentButton(tournament_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore
+
+
+class AdminBracketView(discord.ui.View):
+    """Админ-панель для этапа BRACKET."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=120)
+        self.add_item(DeleteTournamentButton(tournament_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore
+
+
+class AdminFinishedView(discord.ui.View):
+    """Админ-панель для этапа FINISHED."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(timeout=120)
+        self.add_item(DeleteTournamentButton(tournament_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore
+
+
+# --- Админ-кнопки ---
+
+class ApproveSelectButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(style=discord.ButtonStyle.success, label="✅ Одобрить", custom_id="admin_approve")
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        teams = await db.team_list(self.tournament_id)
+        pending = [t for t in teams if not t["approved"]]
+
+        if not pending:
+            await interaction.response.send_message("✅ Все команды уже одобрены.", ephemeral=True)
+            return
+
+        options = [
+            discord.SelectOption(label=t["name"][:100], value=str(t["id"]))
+            for t in pending[:25]
+        ]
+
+        sel = discord.ui.Select(
+            placeholder="Выберите команды для одобрения...",
+            min_values=1,
+            max_values=min(len(options), 25),
+            options=options,
+            custom_id="approve_team_select",
+        )
+
+        async def _approve_cb(sel_interaction: discord.Interaction) -> None:
+            for val in sel.values:
+                await db.team_set_approved(int(val), True)
+
+            approved_names = []
+            for val in sel.values:
+                team = await db.team_get(int(val))
+                if team:
+                    approved_names.append(f"**{team['name']}**")
+
+            await sel_interaction.response.edit_message(
+                content=f"✅ Одобрены: {', '.join(approved_names)}",
+                view=None,
+            )
+            await _update_panel_by_tournament(sel_interaction.client, self.tournament_id)  # type: ignore
+
+        sel.callback = _approve_cb  # type: ignore
+        view = discord.ui.View(timeout=60)
+        view.add_item(sel)
+        await interaction.response.send_message("Выберите команды:", view=view, ephemeral=True)
+
+
+class RejectSelectButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(style=discord.ButtonStyle.danger, label="❌ Отклонить", custom_id="admin_reject")
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        teams = await db.team_list(self.tournament_id)
+        if not teams:
+            await interaction.response.send_message("Нет команд.", ephemeral=True)
+            return
+
+        options = [
+            discord.SelectOption(label=t["name"][:100], value=str(t["id"]))
+            for t in teams[:25]
+        ]
+
+        sel = discord.ui.Select(
+            placeholder="Выберите команду для удаления...",
+            min_values=1,
+            max_values=min(len(options), 25),
+            options=options,
+            custom_id="reject_team_select",
+        )
+
+        async def _reject_cb(sel_interaction: discord.Interaction) -> None:
+            removed_names = []
+            for val in sel.values:
+                team = await db.team_get(int(val))
+                if team:
+                    removed_names.append(f"**{team['name']}**")
+                await db.team_delete(int(val))
+
+            await sel_interaction.response.edit_message(
+                content=f"🗑 Удалены: {', '.join(removed_names)}",
+                view=None,
+            )
+            await _update_panel_by_tournament(sel_interaction.client, self.tournament_id)  # type: ignore
+
+        sel.callback = _reject_cb  # type: ignore
+        view = discord.ui.View(timeout=60)
+        view.add_item(sel)
+        await interaction.response.send_message("Выберите команды для удаления:", view=view, ephemeral=True)
+
+
+class ViewApplicationsButton(discord.ui.Button):
+    """📋 Анкеты — просмотр анкет поданных команд."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="📋 Анкеты",
+            custom_id="admin_apps",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        apps = await db.application_list(self.tournament_id)
+        if not apps:
+            await interaction.response.send_message(
+                "📋 Нет заполненных анкет.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"📋 Анкеты — турнир #{self.tournament_id}",
+            color=config.EMBED_COLOR,
+        )
+
+        for app in apps[:10]:
+            answers = json.loads(app["answers"])
+            answer_lines = []
+            for q, a in answers.items():
+                answer_lines.append(f"**{q}:** {a[:100]}")
+
+            status = "✅" if app["status"] == "approved" else "⏳"
+            text = "\n".join(answer_lines) or "Нет ответов"
+            embed.add_field(
+                name=f"{status} {app['team_name']} (<@{app['user_id']}>)",
+                value=text[:1024],
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CloseRegButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(style=discord.ButtonStyle.secondary, label="🔒 Закрыть набор", custom_id="admin_close")
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await db.tournament_set_status(self.tournament_id, "closed")
+        await _update_panel_by_tournament(interaction.client, self.tournament_id)  # type: ignore
+        await interaction.response.edit_message(
+            content="🔒 Набор закрыт! Теперь можно сгенерировать сетку.",
+            view=None,
+        )
+
+
+class ReopenRegButton(discord.ui.Button):
+    """🔓 Открыть набор — вернуть турнир в статус OPEN."""
+
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="🔓 Открыть набор",
+            custom_id="admin_reopen",
+        )
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await db.tournament_set_status(self.tournament_id, "open")
+        await _update_panel_by_tournament(interaction.client, self.tournament_id)  # type: ignore
+        await interaction.response.edit_message(
+            content="🔓 Набор снова открыт!",
+            view=None,
+        )
+
+
+class GenerateBracketButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(style=discord.ButtonStyle.success, label="🏆 Сгенерировать сетку", custom_id="admin_gen")
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        tournament = await db.tournament_get(self.tournament_id)
+        if not tournament:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        teams = await db.team_list(self.tournament_id)
+        approved = [t for t in teams if t["approved"]]
+
+        if len(approved) < 2:
+            await interaction.response.send_message(
+                "❌ Нужно минимум 2 одобренные команды.", ephemeral=True
+            )
+            return
+
+        await _generate_bracket(self.tournament_id)
+        await db.tournament_set_status(self.tournament_id, "bracket")
+        await _update_panel_by_tournament(interaction.client, self.tournament_id)  # type: ignore
+
+        await interaction.response.edit_message(
+            content=f"✅ Сетка сгенерирована! {len(approved)} команд.",
+            view=None,
+        )
+
+
+class DeleteTournamentButton(discord.ui.Button):
+    def __init__(self, tournament_id: int) -> None:
+        super().__init__(style=discord.ButtonStyle.danger, label="🗑 Удалить турнир", custom_id="admin_delete")
+        self.tournament_id = tournament_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await db.tournament_delete(self.tournament_id)
+        await interaction.response.edit_message(content="🗑 Турнир удалён.", view=None)
+
+        # Пытаемся удалить панель
+        tournament = await db.tournament_get(self.tournament_id)
+        if tournament and tournament.get("panel_message_id"):
+            try:
+                channel = interaction.client.get_channel(tournament["channel_id"])
+                if channel:
+                    msg = await channel.fetch_message(tournament["panel_message_id"])  # type: ignore
+                    await msg.delete()
+            except Exception:
+                pass
+
+
+# ===========================================================================
+# АДМИН-ПАНЕЛЬ — ПОКАЗАТЬ
+# ===========================================================================
+
+async def _show_admin_open(interaction: discord.Interaction, tournament_id: int) -> None:
+    teams = await db.team_list(tournament_id)
+    pending = [t for t in teams if not t["approved"]]
+    approved = [t for t in teams if t["approved"]]
+    questions = await db.question_list(tournament_id)
+
+    embed = discord.Embed(title="⚙️ Управление турниром", color=config.EMBED_COLOR)
+    embed.add_field(name="Ожидают одобрения", value=str(len(pending)), inline=True)
+    embed.add_field(name="Одобрено", value=str(len(approved)), inline=True)
+    embed.add_field(name="Вопросов в анкете", value=str(len(questions)), inline=True)
+
+    if pending:
+        names = "\n".join(f"⏳ {t['name']} (#{t['id']})" for t in pending[:10])
+        embed.add_field(name="Неодобренные", value=names, inline=False)
+
+    view = AdminOpenView(tournament_id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def _show_admin_closed(interaction: discord.Interaction, tournament_id: int) -> None:
+    teams = await db.team_list(tournament_id)
+    approved = [t for t in teams if t["approved"]]
+
+    embed = discord.Embed(title="⚙️ Набор закрыт", color=config.EMBED_COLOR)
+    embed.add_field(name="Одобренных команд", value=str(len(approved)), inline=True)
+
+    view = AdminClosedView(tournament_id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def _show_admin_bracket(interaction: discord.Interaction, tournament_id: int) -> None:
+    matches = await db.match_list(tournament_id)
+    completed = sum(1 for m in matches if m["status"] == "completed")
+    playing = sum(1 for m in matches if m["status"] == "playing")
+    pending = sum(1 for m in matches if m["status"] == "pending")
+
+    embed = discord.Embed(title="⚙️ Турнир идёт", color=config.EMBED_COLOR)
+    embed.add_field(name="Матчей завершено", value=str(completed), inline=True)
+    embed.add_field(name="В процессе", value=str(playing), inline=True)
+    embed.add_field(name="Ожидает", value=str(pending), inline=True)
+
+    view = AdminBracketView(tournament_id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def _show_admin_finished(interaction: discord.Interaction, tournament_id: int) -> None:
+    embed = discord.Embed(title="⚙️ Турнир завершён", color=config.EMBED_COLOR)
+
+    matches = await db.match_list(tournament_id)
+    if matches:
+        final = max(matches, key=lambda m: m["round"])
+        if final.get("winner_id"):
+            champ = await db.team_get(final["winner_id"])
+            if champ:
+                embed.add_field(name="🏆 Чемпион", value=f"**{champ['name']}**", inline=False)
+
+    view = AdminFinishedView(tournament_id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ===========================================================================
+# MATCH / WINNER DROPDOWNS
+# ===========================================================================
+
+class MatchSelect(discord.ui.Select):
+    def __init__(self, matches: list[dict], team_map: dict, action: str) -> None:
+        options = []
+        for m in matches[:25]:
+            t1 = team_map.get(m["team1_id"], {}).get("name", "TBD") if m["team1_id"] else "TBD"
+            t2 = team_map.get(m["team2_id"], {}).get("name", "TBD") if m["team2_id"] else "TBD"
+            label = f"#{m['id']} {t1} vs {t2}"
+            rnd_name = _round_name(max(mm["round"] for mm in matches), m["round"]) if matches else f"Раунд {m['round']}"
+            options.append(discord.SelectOption(
+                label=label[:100], value=str(m["id"]),
+                description=rnd_name,
+            ))
+        super().__init__(
+            placeholder="Выберите матч...",
+            min_values=1, max_values=1,
+            options=options,
+            custom_id=f"match_sel_{action}",
+        )
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        match_id = int(self.values[0])
+        if self.action == "start":
+            await _do_start_match(interaction, match_id)
+        elif self.action == "winner":
+            await _show_winner_dropdown(interaction, match_id)
+
+
+class MatchSelectView(discord.ui.View):
+    def __init__(self, matches: list[dict], team_map: dict, action: str) -> None:
+        super().__init__(timeout=60)
+        self.add_item(MatchSelect(matches, team_map, action))
+
+
+class WinnerSelect(discord.ui.Select):
+    def __init__(self, match_id: int, t1_id: int, t2_id: int, t1_name: str, t2_name: str) -> None:
+        self.match_id = match_id
+        options = [
+            discord.SelectOption(label=t1_name[:100], value=str(t1_id)),
+            discord.SelectOption(label=t2_name[:100], value=str(t2_id)),
+        ]
+        super().__init__(
+            placeholder="Выберите победителя...",
+            min_values=1, max_values=1,
+            options=options, custom_id="winner_sel",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        winner_id = int(self.values[0])
+        await _do_set_winner(interaction, self.match_id, winner_id)
+
+
+class WinnerSelectView(discord.ui.View):
+    def __init__(self, match_id: int, t1_id: int, t2_id: int, t1_name: str, t2_name: str) -> None:
+        super().__init__(timeout=60)
+        self.add_item(WinnerSelect(match_id, t1_id, t2_id, t1_name, t2_name))
+
+
+# ===========================================================================
+# MATCH ACTIONS
+# ===========================================================================
+
+async def _do_start_match(interaction: discord.Interaction, match_id: int) -> None:
+    match_data = await db.match_get(match_id)
+    if not match_data or match_data["status"] != "pending":
+        await interaction.response.send_message("❌ Матч не найден или уже запущен.", ephemeral=True)
+        return
+
+    if not match_data["team1_id"] or not match_data["team2_id"]:
+        await interaction.response.send_message("❌ В матче не хватает участников.", ephemeral=True)
+        return
+
+    await db.match_set_status(match_id, "playing")
+
+    team1 = await db.team_get(match_data["team1_id"])
+    team2 = await db.team_get(match_data["team2_id"])
+    t1_name = team1["name"] if team1 else "???"
+    t2_name = team2["name"] if team2 else "???"
+
+    t1_mentions = " ".join(f"<@{uid}>" for uid in json.loads(team1["members"])) if team1 else "—"
+    t2_mentions = " ".join(f"<@{uid}>" for uid in json.loads(team2["members"])) if team2 else "—"
+
+    embed = discord.Embed(
+        title="⚔️ Матч начат!",
+        description=f"**{t1_name}** vs **{t2_name}**",
+        color=config.EMBED_COLOR,
+    )
+    embed.add_field(name=t1_name, value=t1_mentions, inline=True)
+    embed.add_field(name=t2_name, value=t2_mentions, inline=True)
+    embed.add_field(name="Матч", value=f"#{match_id}", inline=True)
+
+    await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+    # Уведомляем участников в канале
+    await _update_panel_by_tournament(interaction.client, match_data["tournament_id"])  # type: ignore
+
+
+async def _show_winner_dropdown(interaction: discord.Interaction, match_id: int) -> None:
+    match_data = await db.match_get(match_id)
+    if not match_data or match_data["status"] != "playing":
+        await interaction.response.send_message("❌ Матч должен быть запущен.", ephemeral=True)
+        return
+
+    team1 = await db.team_get(match_data["team1_id"])
+    team2 = await db.team_get(match_data["team2_id"])
+    t1_name = team1["name"] if team1 else "???"
+    t2_name = team2["name"] if team2 else "???"
+
+    view = WinnerSelectView(match_id, match_data["team1_id"], match_data["team2_id"], t1_name, t2_name)
+    embed = discord.Embed(
+        title="🏆 Выберите победителя",
+        description=f"**{t1_name}** vs **{t2_name}**\nМатч #{match_id}",
+        color=config.EMBED_COLOR,
+    )
+    await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+
+async def _do_set_winner(interaction: discord.Interaction, match_id: int, winner_id: int) -> None:
+    match_data = await db.match_get(match_id)
+    if not match_data:
+        await interaction.response.send_message("❌ Матч не найден.", ephemeral=True)
+        return
+
+    await db.match_set_winner(match_id, winner_id)
+
+    winner_team = await db.team_get(winner_id)
+    loser_id = match_data["team2_id"] if winner_id == match_data["team1_id"] else match_data["team1_id"]
+    loser_team = await db.team_get(loser_id)
+    winner_name = winner_team["name"] if winner_team else "???"
+    loser_name = loser_team["name"] if loser_team else "???"
+
+    embed = discord.Embed(
+        title="🏆 Победитель!",
+        description=f"**{winner_name}** побеждает **{loser_name}**",
+        color=config.EMBED_COLOR,
+    )
+
+    # Продвигаем победителя по сетке
+    tournament_id = match_data["tournament_id"]
+    next_round = match_data["round"] + 1
+    next_match_idx = match_data["match_index"] // 2
+
+    all_matches = await db.match_list(tournament_id)
+    next_match = next(
+        (m for m in all_matches if m["round"] == next_round and m["match_index"] == next_match_idx),
+        None,
+    )
+
+    if next_match:
+        slot = "team1_id" if match_data["match_index"] % 2 == 0 else "team2_id"
+        await db.match_update_team(next_match["id"], slot, winner_id)
     else:
-        await interaction.response.send_message(embed=embed, file=file, view=view)
+        max_round = max((m["round"] for m in all_matches), default=1)
+        if match_data["round"] >= max_round:
+            await db.tournament_set_status(tournament_id, "finished")
+            embed.add_field(name="🎉 Турнир завершён!", value=f"**{winner_name}** — чемпион!", inline=False)
+
+    await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+    # Обновляем панель
+    await _update_panel_by_tournament(interaction.client, tournament_id)  # type: ignore
 
 
-# ---------------------------------------------------------------------------
-# Helper: генерация матчей (Single Elimination bracket)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# ГЕНЕРАЦИЯ СЕТКИ
+# ===========================================================================
 
-async def _generate_matches(tournament_id: int) -> None:
-    """Генерирует матчи для Single Elimination на основе одобренных команд."""
+async def _generate_bracket(tournament_id: int) -> None:
+    """Генерирует Single Elimination сетку для турнира."""
     teams = await db.team_list(tournament_id)
     approved = [t for t in teams if t["approved"]]
 
@@ -193,592 +1072,744 @@ async def _generate_matches(tournament_id: int) -> None:
         return
 
     # Очищаем старые матчи
-    existing = await db.match_list(tournament_id)
-    # (не удаляем завершённые матчи — только pending)
+    await db.match_delete_for_tournament(tournament_id)
 
-    # Для SE нужно количество команд = степень двойки.
-    # Если не хватает — добавляем "bye" (пропуск).
+    # Рассчитываем размер сетки (степень двойки)
     n = len(approved)
-    import math
-    next_pow2 = 2 ** math.ceil(math.log2(n))
+    bracket_size = 1
+    while bracket_size < n:
+        bracket_size *= 2
 
-    # Bye-команды получают автоматический пропуск в следующий раунд
-    bye_count = next_pow2 - n
+    # Количество раундов
+    num_rounds = int(math.log2(bracket_size))
 
-    # Жеребьёвка — перемешиваем команды
-    import random
-    seeds = list(range(n))
-    random.shuffle(seeds)
+    # Перемешиваем команды для сеяния
+    seeded = list(approved)
+    random.shuffle(seeded)
 
-    round1_match_count = next_pow2 // 2
+    # Рассчитываем byes
+    byes = bracket_size - n
+
+    # Создаём матчи первого раунда
     match_idx = 0
+    team_idx = 0
+    first_round_matches = bracket_size // 2
 
-    for i in range(round1_match_count):
-        seed1 = seeds[i * 2] if i * 2 < n else None
-        seed2 = seeds[i * 2 + 1] if i * 2 + 1 < n else None
+    for i in range(first_round_matches):
+        t1_id = 0
+        t2_id = 0
 
-        team1_id = approved[seed1]["id"] if seed1 is not None else 0
-        team2_id = approved[seed2]["id"] if seed2 is not None else 0
+        if i < byes:
+            # Bye: первая команда проходит автоматически
+            if team_idx < n:
+                t1_id = seeded[team_idx]["id"]
+                team_idx += 1
+            t2_id = 0  # Bye
+        else:
+            if team_idx < n:
+                t1_id = seeded[team_idx]["id"]
+                team_idx += 1
+            if team_idx < n:
+                t2_id = seeded[team_idx]["id"]
+                team_idx += 1
 
-        if team1_id and not team2_id:
-            # Bye — команда 1 автоматически проходит
-            await db.match_create(
-                tournament_id, team1_id, 0, 1, match_idx
-            )
-        elif not team1_id and team2_id:
-            await db.match_create(
-                tournament_id, team2_id, 0, 1, match_idx
-            )
-        elif team1_id and team2_id:
-            await db.match_create(
-                tournament_id, team1_id, team2_id, 1, match_idx
-            )
-
+        await db.match_create(tournament_id, t1_id, t2_id, 1, match_idx)
         match_idx += 1
 
-    # Создаём пустые слоты для следующих раундов
-    rounds_count = int(math.log2(next_pow2))
-    for r in range(2, rounds_count + 1):
-        matches_in_round = next_pow2 // (2 ** r)
-        for m in range(matches_in_round):
-            await db.match_create(tournament_id, 0, 0, r, m)
+    # Автоматически продвигаем команды с bye
+    matches_r1 = await db.match_list(tournament_id)
+    for m in matches_r1:
+        if m["team1_id"] and not m["team2_id"]:
+            # Bye — команда автоматически в следующем раунде
+            next_round = 2
+            next_idx = m["match_index"] // 2
+            next_matches = [mm for mm in matches_r1 if mm["round"] == next_round and mm["match_index"] == next_idx]
+            if next_matches:
+                slot = "team1_id" if m["match_index"] % 2 == 0 else "team2_id"
+                await db.match_update_team(next_matches[0]["id"], slot, m["team1_id"])
+
+    # Создаём пустые матчи для последующих раундов
+    for rnd in range(2, num_rounds + 1):
+        matches_in_round = bracket_size // (2 ** rnd)
+        for idx in range(matches_in_round):
+            await db.match_create(tournament_id, 0, 0, rnd, idx)
+
+    # Заполняем команды с bye в матчи следующих раундов
+    all_matches = await db.match_list(tournament_id)
+    for rnd in range(2, num_rounds + 1):
+        round_matches = [m for m in all_matches if m["round"] == rnd]
+        prev_matches = [m for m in all_matches if m["round"] == rnd - 1]
+
+        for m in round_matches:
+            prev1 = next((p for p in prev_matches if p["match_index"] == m["match_index"] * 2), None)
+            prev2 = next((p for p in prev_matches if p["match_index"] == m["match_index"] * 2 + 1), None)
+
+            # Если предыдущий матч завершён (bye), продвигаем команду
+            if prev1 and prev1["status"] == "completed" and prev1["winner_id"]:
+                await db.match_update_team(m["id"], "team1_id", prev1["winner_id"])
+            elif prev1 and prev1["team1_id"] and not prev1["team2_id"]:
+                # Bye в предыдущем — продвигаем автоматически
+                await db.match_set_winner(prev1["id"], prev1["team1_id"])
+                await db.match_update_team(m["id"], "team1_id", prev1["team1_id"])
+
+            if prev2 and prev2["status"] == "completed" and prev2["winner_id"]:
+                await db.match_update_team(m["id"], "team2_id", prev2["winner_id"])
+            elif prev2 and prev2["team1_id"] and not prev2["team2_id"]:
+                await db.match_set_winner(prev2["id"], prev2["team1_id"])
+                await db.match_update_team(m["id"], "team2_id", prev2["team1_id"])
 
 
-# ---------------------------------------------------------------------------
-# Cog
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# ПАНЕЛЬ — СБОРКА И ОБНОВЛЕНИЕ
+# ===========================================================================
+
+async def _build_panel(tournament_id: int, tournament: dict) -> tuple:
+    """Собирает embed + view для панели турнира (любой этап)."""
+
+    status = tournament["status"]
+    team_size = tournament["team_size"]
+    is_dm = tournament.get("is_team_dm", 0)
+    channel_id = tournament.get("channel_id", 0)
+    panel_msg_id = tournament.get("panel_message_id", 0)
+    fmt = _format_str(team_size, is_dm)
+    max_str = str(tournament["max_teams"]) if tournament["max_teams"] > 0 else "∞"
+
+    if status == "open":
+        return await _build_registration_panel(tournament_id, tournament, fmt, max_str, channel_id, panel_msg_id)
+    elif status == "closed":
+        return await _build_closed_panel(tournament_id, tournament, fmt, max_str)
+    elif status in ("bracket", "finished"):
+        return await _build_bracket_panel(tournament_id, tournament, fmt)
+    else:
+        embed = discord.Embed(title=f"🏆 {tournament['name']}", color=config.EMBED_COLOR)
+        view = discord.ui.View()
+        return (embed, view)
+
+
+async def _build_registration_panel(
+    tournament_id: int, tournament: dict, fmt: str, max_str: str,
+    channel_id: int, panel_msg_id: int,
+) -> tuple:
+    """Собирает embed + view для этапа OPEN."""
+    teams = await db.team_list(tournament_id)
+    approved = sum(1 for t in teams if t.get("approved"))
+    pending = sum(1 for t in teams if not t.get("approved"))
+    questions = await db.question_list(tournament_id)
+
+    embed = discord.Embed(
+        title=f"🏆 {tournament['name']}",
+        description=tournament.get("description") or None,
+        color=config.EMBED_COLOR,
+    )
+    embed.add_field(name="Формат", value=fmt, inline=True)
+    embed.add_field(name="ID", value=f"#{tournament_id}", inline=True)
+    embed.add_field(name="Статус", value="🟢 Открыт", inline=True)
+    embed.add_field(name="Команды", value=f"{len(teams)}/{max_str}", inline=True)
+    embed.add_field(name="Одобрено", value=f"✅ {approved}", inline=True)
+    embed.add_field(name="Ожидают", value=f"⏳ {pending}", inline=True)
+
+    # Вопросы анкеты
+    if questions:
+        q_list = "\n".join(f"• {q['question_text']}" for q in questions[:10])
+        embed.add_field(name=f"📋 Анкета ({len(questions)} вопросов)", value=q_list, inline=False)
+
+    # Список команд
+    if teams:
+        team_lines = []
+        for t in teams[:12]:
+            status = "✅" if t.get("approved") else "⏳"
+            team_lines.append(f"{status} {t['name']}")
+        if len(teams) > 12:
+            team_lines.append(f"... и ещё {len(teams) - 12}")
+        embed.add_field(name="Участники", value="\n".join(team_lines), inline=False)
+
+    embed.set_footer(text="Нажмите 📝 Записаться для регистрации!")
+
+    view = OpenView(tournament_id, tournament["team_size"], channel_id, panel_msg_id)
+    return (embed, view)
+
+
+async def _build_closed_panel(tournament_id: int, tournament: dict, fmt: str, max_str: str) -> tuple:
+    """Собирает embed + view для этапа CLOSED."""
+    teams = await db.team_list(tournament_id)
+    approved = sum(1 for t in teams if t.get("approved"))
+
+    embed = discord.Embed(
+        title=f"🏆 {tournament['name']}",
+        description=tournament.get("description") or None,
+        color=config.EMBED_COLOR,
+    )
+    embed.add_field(name="Формат", value=fmt, inline=True)
+    embed.add_field(name="ID", value=f"#{tournament_id}", inline=True)
+    embed.add_field(name="Статус", value="🔒 Набор закрыт", inline=True)
+    embed.add_field(name="Команд", value=f"✅ {approved}", inline=True)
+    embed.set_footer(text="Ожидание генерации сетки администрацией...")
+
+    view = ClosedView(tournament_id)
+    return (embed, view)
+
+
+async def _build_bracket_panel(tournament_id: int, tournament: dict, fmt: str) -> tuple:
+    """Собирает embed + file + view для этапа BRACKET / FINISHED."""
+    teams = await db.team_list(tournament_id)
+    matches = await db.match_list(tournament_id)
+
+    if matches:
+        buf = generate_bracket(teams, matches, tournament["name"])
+    else:
+        buf = generate_bracket_simple(teams, tournament["name"])
+
+    file = discord.File(buf, filename="bracket.png")
+
+    status_emoji = {"bracket": "⚔️", "finished": "🏆"}.get(tournament["status"], "❓")
+    status_text = {"bracket": "Идёт", "finished": "Завершён"}.get(tournament["status"], tournament["status"])
+
+    embed = discord.Embed(title=f"🏆 {tournament['name']}", color=config.EMBED_COLOR)
+    embed.set_image(url="attachment://bracket.png")
+    embed.add_field(name="Формат", value=fmt, inline=True)
+    embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
+
+    if matches:
+        completed = sum(1 for m in matches if m["status"] == "completed")
+        playing = sum(1 for m in matches if m["status"] == "playing")
+        embed.add_field(name="Матчи", value=f"✅ {completed} ⚔️ {playing} ⏳ {len(matches) - completed - playing}", inline=True)
+
+    if tournament["status"] == "finished":
+        final_match = next((m for m in matches if m["round"] == max(mm["round"] for mm in matches)), None)
+        if final_match and final_match["winner_id"]:
+            champ = await db.team_get(final_match["winner_id"])
+            if champ:
+                embed.add_field(name="🏆 Чемпион", value=f"**{champ['name']}**", inline=False)
+
+    if tournament["status"] == "finished":
+        view = FinishedView(tournament_id)
+    else:
+        view = BracketView(tournament_id)
+
+    return (embed, file, view)
+
+
+async def _update_panel_by_tournament(client: discord.Client, tournament_id: int) -> None:
+    """Обновляет панель турнира по ID турнира."""
+    tournament = await db.tournament_get(tournament_id)
+    if not tournament:
+        return
+
+    channel_id = tournament.get("channel_id", 0)
+    message_id = tournament.get("panel_message_id", 0)
+    if not channel_id or not message_id:
+        return
+
+    channel = client.get_channel(channel_id)
+    if not channel:
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)  # type: ignore
+    except discord.NotFound:
+        return
+
+    status = tournament["status"]
+
+    if status == "open" or status == "closed":
+        result = await _build_panel(tournament_id, tournament)
+        embed, view = result[0], result[1]
+        await message.edit(embed=embed, view=view)
+    elif status in ("bracket", "finished"):
+        result = await _build_panel(tournament_id, tournament)
+        embed, file, view = result[0], result[1], result[2]
+        await message.edit(embed=embed, attachments=[file], view=view)
+
+
+# ===========================================================================
+# COG
+# ===========================================================================
 
 class TournamentCog(commands.Cog, name="Tournament"):
-    """Система турниров: создание, команды, анкеты, сетка, матчи."""
+    """Система турниров с анкетами, кнопочным управлением и сеткой."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Autocomplete
+    # -----------------------------------------------------------------------
 
-    @staticmethod
-    def _is_admin(interaction: discord.Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
-            return True
-        user_roles = {r.name for r in interaction.user.roles}
-        return bool(user_roles & set(config.ADMIN_ROLES))
+    async def _tournament_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        tournaments = await db.tournament_list(interaction.guild_id)
+        results = []
+        for t in tournaments:
+            label = f"{t['name']} (#{t['id']}) [{_format_str(t['team_size'], t.get('is_team_dm', 0))}]"
+            if current.lower() in label.lower():
+                results.append(app_commands.Choice(name=label[:100], value=str(t["id"])))
+        return results[:25]
 
-    # ------------------------------------------------------------------
-    # /createlobby
-    # ------------------------------------------------------------------
+    async def _question_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        # Получаем tournament из namespace, если он задан
+        tournament_val = interaction.namespace.get("tournament", None)
+        if not tournament_val:
+            return []
+        try:
+            tid = int(tournament_val)
+        except (ValueError, TypeError):
+            return []
 
-    @app_commands.command(
-        name="createlobby",
-        description="Создать турнир/группу",
+        questions = await db.question_list(tid)
+        results = []
+        for q in questions:
+            label = f"#{q['position']+1}: {q['question_text'][:80]}"
+            if current.lower() in label.lower():
+                results.append(app_commands.Choice(name=label[:100], value=str(q["id"])))
+        return results[:25]
+
+    # -----------------------------------------------------------------------
+    # /1vs1  /2vs2  /3vs3  /customlobby
+    # -----------------------------------------------------------------------
+
+    @app_commands.command(name="1vs1", description="Записаться на 1v1 турнир")
+    async def register_1v1(self, interaction: discord.Interaction) -> None:
+        await self._show_tournament_select(interaction, team_size=1)
+
+    @app_commands.command(name="2vs2", description="Записаться на 2v2 турнир")
+    async def register_2v2(self, interaction: discord.Interaction) -> None:
+        await self._show_tournament_select(interaction, team_size=2)
+
+    @app_commands.command(name="3vs3", description="Записаться на 3v3 турнир")
+    async def register_3v3(self, interaction: discord.Interaction) -> None:
+        await self._show_tournament_select(interaction, team_size=3)
+
+    @app_commands.command(name="customlobby", description="Записаться на кастомный турнир (4v4+)")
+    async def register_custom(self, interaction: discord.Interaction) -> None:
+        await self._show_tournament_select(interaction, team_size=0)  # 0 = custom (4+)
+
+    async def _show_tournament_select(self, interaction: discord.Interaction, team_size: int) -> None:
+        """Показывает dropdown выбора турнира для регистрации."""
+        tournaments = await db.tournament_list_by_format(
+            interaction.guild_id, team_size, status="open"
+        )
+
+        if not tournaments:
+            fmt_name = "1v1" if team_size == 1 else f"{team_size}v{team_size}" if team_size else "кастомный"
+            await interaction.response.send_message(
+                f"❌ Нет открытых {fmt_name} турниров для регистрации.",
+                ephemeral=True,
+            )
+            return
+
+        if len(tournaments) == 1:
+            # Только один турнир — показываем модалку сразу
+            t = tournaments[0]
+            questions = await db.question_list(t["id"])
+            max_q = 3 if t["team_size"] > 1 else 4
+            if len(questions) > max_q:
+                questions = questions[:max_q]
+
+            modal = RegisterModal(
+                tournament_id=t["id"],
+                team_size=t["team_size"],
+                questions=questions,
+                channel_id=t.get("channel_id", 0),
+                panel_message_id=t.get("panel_message_id", 0),
+            )
+            await interaction.response.send_modal(modal)
+        else:
+            # Несколько турниров — показываем dropdown
+            view = TournamentSelectView(tournaments, team_size if team_size else 4)
+            fmt_name = "1v1" if team_size == 1 else f"{team_size}v{team_size}" if team_size else "кастомный"
+            embed = discord.Embed(
+                title=f"🏆 Выберите {fmt_name} турнир",
+                description="Выберите турнир из списка для регистрации",
+                color=config.EMBED_COLOR,
+            )
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    # -----------------------------------------------------------------------
+    # /tournament — группа команд администратора
+    # -----------------------------------------------------------------------
+
+    tournament = app_commands.Group(
+        name="tournament",
+        description="Управление турнирами",
+        default_permissions=discord.Permissions(administrator=True),
     )
+
+    questions_grp = app_commands.Group(
+        parent=tournament,
+        name="questions",
+        description="Управление анкетой турнира",
+    )
+
+    # --- /tournament create ---
+
+    @tournament.command(name="create", description="Создать турнир")
     @app_commands.describe(
         name="Название турнира",
-        team_size="Размер команды: 1 (1v1), 2 (2v2), 3 (3v3), и т.д.",
-        is_team_dm="Командный дм? (true/false)",
-        max_teams="Макс. кол-во команд (0 = без лимита)",
-        criteria="Критерии/вопросы анкеты (через |)",
+        format="Формат турнира",
+        max_teams="Макс. команд (0 = без лимита)",
+        description="Описание турнира",
+        team_size="Размер команды (только для формата Custom)",
+        team_dm="Командное ДМ (все против всех)",
     )
-    async def createlobby(
+    @app_commands.choices(format=[
+        app_commands.Choice(name="1v1", value=1),
+        app_commands.Choice(name="2v2", value=2),
+        app_commands.Choice(name="3v3", value=3),
+        app_commands.Choice(name="Custom (укажите team_size)", value=0),
+    ])
+    async def tournament_create(
         self,
         interaction: discord.Interaction,
         name: str,
-        team_size: int = 1,
-        is_team_dm: bool = False,
+        format: int,
         max_teams: int = 0,
-        criteria: str = "",
+        description: str = "",
+        team_size: int = 4,
+        team_dm: bool = False,
     ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
             return
 
-        if team_size < 1:
-            team_size = 1
-        if team_size > 10:
-            await interaction.response.send_message(
-                "❌ Максимальный размер команды — 10.", ephemeral=True
-            )
-            return
+        # Определяем team_size
+        if format == 0:
+            actual_size = max(1, team_size)
+        else:
+            actual_size = format
 
+        # Создаём турнир
         tid = await db.tournament_create(
-            guild_id=interaction.guild_id,  # type: ignore
+            guild_id=interaction.guild_id,
             channel_id=interaction.channel_id,
             name=name,
-            team_size=team_size,
-            is_team_dm=is_team_dm,
+            team_size=actual_size,
+            is_team_dm=team_dm,
             max_teams=max_teams,
-            criteria=criteria,
+            description=description,
         )
 
-        size_str = f"{team_size}v{team_size}" if team_size > 1 else "1v1"
-        mode_str = " (Командное ДМ)" if is_team_dm else ""
-
+        fmt_str = _format_str(actual_size, team_dm)
         embed = discord.Embed(
-            title=f"🏆 Турнир создан: {name}",
+            title=f"🏆 Турнир создан!",
+            description=f"**{name}** (#{tid})",
             color=config.EMBED_COLOR,
         )
-        embed.add_field(name="Формат", value=f"{size_str}{mode_str}", inline=True)
-        embed.add_field(name="ID турнира", value=f"#{tid}", inline=True)
-        embed.add_field(
-            name="Макс. команд",
-            value=str(max_teams) if max_teams > 0 else "Без лимита",
-            inline=True,
-        )
+        embed.add_field(name="Формат", value=fmt_str, inline=True)
+        embed.add_field(name="Макс. команд", value=str(max_teams) if max_teams > 0 else "∞", inline=True)
+        if description:
+            embed.add_field(name="Описание", value=description[:200], inline=False)
+        embed.set_footer(text="Добавьте вопросы через /tournament questions add")
 
-        if criteria:
-            embed.add_field(
-                name="📋 Критерии / Вопросы анкеты",
-                value=criteria.replace("|", "\n• "),
-                inline=False,
-            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # Добавляем кнопку «Подать заявку»
-        view = LobbyView(tid, criteria)
-        await interaction.response.send_message(embed=embed, view=view)
+    # --- /tournament questions add ---
 
-    # ------------------------------------------------------------------
-    # /lobbylist
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="lobbylist",
-        description="Список команд турнира + картинка сетки",
-    )
+    @questions_grp.command(name="add", description="Добавить вопрос в анкету турнира")
     @app_commands.describe(
-        tournament_id="ID турнира",
+        tournament="Турнир (введите ID или название)",
+        question="Текст вопроса",
     )
-    async def lobbylist(
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def questions_add(
         self,
         interaction: discord.Interaction,
-        tournament_id: int,
+        tournament: str,
+        question: str,
     ) -> None:
-        await _send_bracket(interaction, tournament_id)
-
-    # ------------------------------------------------------------------
-    # /deleteteam
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="deleteteam",
-        description="Удалить команду из турнира",
-    )
-    @app_commands.describe(
-        team_id="ID команды для удаления",
-    )
-    async def deleteteam(
-        self,
-        interaction: discord.Interaction,
-        team_id: int,
-    ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
             return
 
-        team = await db.team_get(team_id)
-        if not team:
-            await interaction.response.send_message(
-                f"❌ Команда #{team_id} не найдена.", ephemeral=True
-            )
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
             return
 
-        deleted = await db.team_delete(team_id)
-        if deleted:
-            embed = discord.Embed(
-                title="🗑 Команда удалена",
-                description=f"**{team['name']}** (#{team_id}) удалена из турнира.",
-                color=config.EMBED_COLOR,
-            )
-            await interaction.response.send_message(embed=embed)
-        else:
-            await interaction.response.send_message(
-                f"❌ Не удалось удалить команду #{team_id}.", ephemeral=True
-            )
-
-    # ------------------------------------------------------------------
-    # /setwinner
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="setwinner",
-        description="Установить победителя матча",
-    )
-    @app_commands.describe(
-        match_id="ID матча",
-        winner_team_id="ID команды-победителя",
-    )
-    async def setwinner(
-        self,
-        interaction: discord.Interaction,
-        match_id: int,
-        winner_team_id: int,
-    ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
             return
 
-        matches = await db.match_list(0)  # Получим все
-        # Лучше искать напрямую
-        from database import _connection, aiosqlite
-        async with _connection() as db_conn:
-            db_conn.row_factory = aiosqlite.Row
-            rows = await db_conn.execute_fetchall(
-                "SELECT * FROM matches WHERE id = ?", (match_id,)
-            )
-
-        if not rows:
+        # Проверяем лимит вопросов (макс 4 для 1v1, 3 для командных)
+        max_q = 4 if t["team_size"] == 1 else 3
+        current_count = await db.question_count(tid)
+        if current_count >= max_q:
             await interaction.response.send_message(
-                f"❌ Матч #{match_id} не найден.", ephemeral=True
-            )
-            return
-
-        match_data = dict(rows[0])
-
-        # Проверяем, что winner — один из участников матча
-        if winner_team_id not in (match_data["team1_id"], match_data["team2_id"]):
-            await interaction.response.send_message(
-                "❌ Указанная команда не участвует в этом матче.", ephemeral=True
-            )
-            return
-
-        await db.match_set_winner(match_id, winner_team_id)
-
-        winner_team = await db.team_get(winner_team_id)
-        winner_name = winner_team["name"] if winner_team else "???"
-
-        embed = discord.Embed(
-            title="🏆 Победитель установлен",
-            color=config.EMBED_COLOR,
-        )
-        embed.add_field(name="Матч", value=f"#{match_id}", inline=True)
-        embed.add_field(name="Победитель", value=winner_name, inline=True)
-
-        # Продвигаем победителя в следующий раунд
-        tournament_id = match_data["tournament_id"]
-        next_round = match_data["round"] + 1
-        next_match_idx = match_data["match_index"] // 2
-
-        # Ищем или создаём матч следующего раунда
-        next_matches = await db.match_list(tournament_id)
-        next_match = next(
-            (m for m in next_matches if m["round"] == next_round and m["match_index"] == next_match_idx),
-            None,
-        )
-
-        if next_match:
-            # Ставим победителя в свободный слот
-            if next_match["team1_id"] == 0:
-                from database import _connection as _conn2
-                async with _conn2() as db2:
-                    await db2.execute(
-                        "UPDATE matches SET team1_id = ? WHERE id = ?",
-                        (winner_team_id, next_match["id"]),
-                    )
-                    await db2.commit()
-            elif next_match["team2_id"] == 0:
-                from database import _connection as _conn3
-                async with _conn3() as db3:
-                    await db3.execute(
-                        "UPDATE matches SET team2_id = ? WHERE id = ?",
-                        (winner_team_id, next_match["id"]),
-                    )
-                    await db3.commit()
-        else:
-            # Создаём матч следующего раунда
-            await db.match_create(tournament_id, winner_team_id, 0, next_round, next_match_idx)
-
-        await interaction.response.send_message(embed=embed)
-
-    # ------------------------------------------------------------------
-    # /startmatch
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="startmatch",
-        description="Запустить матч",
-    )
-    @app_commands.describe(
-        match_id="ID матча для запуска",
-    )
-    async def startmatch(
-        self,
-        interaction: discord.Interaction,
-        match_id: int,
-    ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
-            return
-
-        from database import _connection, aiosqlite
-        async with _connection() as db_conn:
-            db_conn.row_factory = aiosqlite.Row
-            rows = await db_conn.execute_fetchall(
-                "SELECT * FROM matches WHERE id = ?", (match_id,)
-            )
-
-        if not rows:
-            await interaction.response.send_message(
-                f"❌ Матч #{match_id} не найден.", ephemeral=True
-            )
-            return
-
-        match_data = dict(rows[0])
-
-        if match_data["status"] != "pending":
-            await interaction.response.send_message(
-                f"❌ Матч #{match_id} уже {'идёт' if match_data['status'] == 'playing' else 'завершён'}.",
+                f"❌ Лимит вопросов: {max_q} для {_format_str(t['team_size'])}. "
+                f"Уже добавлено: {current_count}.",
                 ephemeral=True,
             )
             return
 
-        if not match_data["team1_id"] or not match_data["team2_id"]:
-            await interaction.response.send_message(
-                "❌ В матче не хватает участников (TBD).", ephemeral=True
-            )
-            return
+        qid = await db.question_add(tid, question, required=True)
 
-        await db.match_set_status(match_id, "playing")
-
-        team1 = await db.team_get(match_data["team1_id"])
-        team2 = await db.team_get(match_data["team2_id"])
-
-        t1_name = team1["name"] if team1 else "???"
-        t2_name = team2["name"] if team2 else "???"
-
-        # Упоминания участников
-        t1_mentions = ""
-        t2_mentions = ""
-        if team1:
-            members = json.loads(team1["members"])
-            t1_mentions = " ".join(f"<@{uid}>" for uid in members)
-        if team2:
-            members = json.loads(team2["members"])
-            t2_mentions = " ".join(f"<@{uid}>" for uid in members)
+        # Обновляем панель, если она есть
+        await _update_panel_by_tournament(interaction.client, tid)
 
         embed = discord.Embed(
-            title="⚔️ Матч начат!",
-            description=f"**{t1_name}** vs **{t2_name}**",
+            title="✅ Вопрос добавлен",
+            description=f"**{question}**",
             color=config.EMBED_COLOR,
         )
-        embed.add_field(name=t1_name, value=t1_mentions or "—", inline=True)
-        embed.add_field(name=t2_name, value=t2_mentions or "—", inline=True)
-        embed.add_field(name="Матч ID", value=f"#{match_id}", inline=True)
+        embed.add_field(name="Турнир", value=f"{t['name']} (#{tid})", inline=True)
+        embed.add_field(name="Вопросов", value=f"{current_count + 1}/{max_q}", inline=True)
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ------------------------------------------------------------------
-    # /approveteam
-    # ------------------------------------------------------------------
+    # --- /tournament questions remove ---
 
-    @app_commands.command(
-        name="approveteam",
-        description="Одобрить команду для участия в турнире",
-    )
-    @app_commands.describe(
-        team_id="ID команды",
-    )
-    async def approveteam(
+    @questions_grp.command(name="remove", description="Удалить вопрос из анкеты турнира")
+    @app_commands.describe(tournament="Турнир")
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def questions_remove(
         self,
         interaction: discord.Interaction,
-        team_id: int,
+        tournament: str,
     ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
             return
 
-        team = await db.team_get(team_id)
-        if not team:
-            await interaction.response.send_message(
-                f"❌ Команда #{team_id} не найдена.", ephemeral=True
-            )
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
             return
 
-        await db.team_set_approved(team_id, True)
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
 
-        embed = discord.Embed(
-            title="✅ Команда одобрена",
-            description=f"**{team['name']}** (#{team_id}) допущена к турниру!",
-            color=config.EMBED_COLOR,
+        questions = await db.question_list(tid)
+        if not questions:
+            await interaction.response.send_message("❌ Нет вопросов для удаления.", ephemeral=True)
+            return
+
+        # Показываем dropdown для выбора вопроса
+        options = [
+            discord.SelectOption(
+                label=f"#{q['position']+1}: {q['question_text'][:80]}",
+                value=str(q["id"]),
+            )
+            for q in questions[:25]
+        ]
+
+        sel = discord.ui.Select(
+            placeholder="Выберите вопрос для удаления...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="question_remove_select",
         )
-        await interaction.response.send_message(embed=embed)
 
-    # ------------------------------------------------------------------
-    # /joinlobby
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="joinlobby",
-        description="Присоединиться к турниру (подать заявку / создать команду)",
-    )
-    @app_commands.describe(
-        tournament_id="ID турнира",
-        team_name="Название команды (для 2v2+)",
-        members="Участники команды через пробел (для 2v2+)",
-    )
-    async def joinlobby(
-        self,
-        interaction: discord.Interaction,
-        tournament_id: int,
-        team_name: str = "",
-        members: str = "",
-    ) -> None:
-        tournament = await db.tournament_get(tournament_id)
-        if not tournament:
-            await interaction.response.send_message(
-                f"❌ Турнир #{tournament_id} не найден.", ephemeral=True
-            )
-            return
-
-        if tournament["status"] != "open":
-            await interaction.response.send_message(
-                "❌ Набор на этот турнир закрыт.", ephemeral=True
-            )
-            return
-
-        # Проверяем лимит команд
-        existing_teams = await db.team_list(tournament_id)
-        if tournament["max_teams"] > 0 and len(existing_teams) >= tournament["max_teams"]:
-            await interaction.response.send_message(
-                "❌ Достигнут лимит команд на этом турнире.", ephemeral=True
-            )
-            return
-
-        team_size = tournament["team_size"]
-
-        # Для solo (1v1) — автоматически создаём команду из одного участника
-        if team_size == 1:
-            # Проверяем, не состоит ли уже в команде
-            for t in existing_teams:
-                member_ids = json.loads(t["members"])
-                if interaction.user.id in member_ids:
-                    await interaction.response.send_message(
-                        "⚠️ Вы уже состоите в команде на этом турнире.", ephemeral=True
-                    )
-                    return
-
-            team_name_final = team_name or interaction.user.display_name
-            tid = await db.team_create(tournament_id, team_name_final, [interaction.user.id])
-            await db.team_set_approved(tid, True)  # Автоодобрение для 1v1
-
-            await interaction.response.send_message(
-                f"✅ Вы записаны на турнир **{tournament['name']}** как **{team_name_final}**!",
-                ephemeral=True,
-            )
-        else:
-            # Командный турнир — нужен список участников
-            if not team_name:
-                await interaction.response.send_message(
-                    f"❌ Для {team_size}v{team_size} укажите название команды: "
-                    f"`/joinlobby {tournament_id} <название> @участники`",
-                    ephemeral=True,
+        async def _remove_cb(sel_interaction: discord.Interaction) -> None:
+            qid = int(sel.values[0])
+            removed = await db.question_remove(qid)
+            if removed:
+                await _update_panel_by_tournament(sel_interaction.client, tid)  # type: ignore
+                await sel_interaction.response.edit_message(
+                    content="✅ Вопрос удалён.", view=None,
                 )
-                return
-
-            # Парсим участников
-            import re
-            member_ids: list[int] = [interaction.user.id]  # Создатель всегда в команде
-            for match in re.findall(r"<@!?(\d+)>", members):
-                member_ids.append(int(match))
-            for part in members.split():
-                if part.isdigit():
-                    member_ids.append(int(part))
-
-            # Убираем дубликаты
-            member_ids = list(dict.fromkeys(member_ids))
-
-            if len(member_ids) < team_size:
-                await interaction.response.send_message(
-                    f"❌ Для формата {team_size}v{team_size} нужно минимум {team_size} участников. "
-                    f"Указано: {len(member_ids)}.",
-                    ephemeral=True,
+            else:
+                await sel_interaction.response.edit_message(
+                    content="❌ Вопрос не найден.", view=None,
                 )
-                return
 
-            # Обрезаем до нужного размера
-            member_ids = member_ids[:team_size]
+        sel.callback = _remove_cb  # type: ignore
+        view = discord.ui.View(timeout=60)
+        view.add_item(sel)
+        await interaction.response.send_message("Выберите вопрос:", view=view, ephemeral=True)
 
-            # Проверяем, не состоит ли кто-то уже в команде
-            for t in existing_teams:
-                existing_members = json.loads(t["members"])
-                overlap = set(member_ids) & set(existing_members)
-                if overlap:
-                    overlap_mentions = " ".join(f"<@{uid}>" for uid in overlap)
-                    await interaction.response.send_message(
-                        f"⚠️ {overlap_mentions} уже состоит в команде **{t['name']}** на этом турнире.",
-                        ephemeral=True,
-                    )
-                    return
+    # --- /tournament questions list ---
 
-            tid = await db.team_create(tournament_id, team_name, member_ids)
-
-            embed = discord.Embed(
-                title="📋 Заявка на участие",
-                description=f"**{team_name}** — ожидает одобрения администрации.",
-                color=config.EMBED_COLOR,
-            )
-            embed.add_field(
-                name="Участники",
-                value=" ".join(f"<@{uid}>" for uid in member_ids),
-                inline=False,
-            )
-            embed.add_field(name="ID команды", value=f"#{tid}", inline=True)
-            await interaction.response.send_message(embed=embed)
-
-    # ------------------------------------------------------------------
-    # /generatebracket
-    # ------------------------------------------------------------------
-
-    @app_commands.command(
-        name="generatebracket",
-        description="Сгенерировать турнирную сетку (Single Elimination)",
-    )
-    @app_commands.describe(
-        tournament_id="ID турнира",
-    )
-    async def generatebracket(
+    @questions_grp.command(name="list", description="Показать список вопросов анкеты")
+    @app_commands.describe(tournament="Турнир")
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def questions_list(
         self,
         interaction: discord.Interaction,
-        tournament_id: int,
+        tournament: str,
     ) -> None:
-        if not self._is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
             return
 
-        tournament = await db.tournament_get(tournament_id)
-        if not tournament:
-            await interaction.response.send_message(
-                f"❌ Турнир #{tournament_id} не найден.", ephemeral=True
-            )
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
             return
 
-        teams = await db.team_list(tournament_id)
-        approved = [t for t in teams if t["approved"]]
+        questions = await db.question_list(tid)
 
-        if len(approved) < 2:
-            await interaction.response.send_message(
-                "❌ Нужно минимум 2 одобренные команды для генерации сетки.",
-                ephemeral=True,
-            )
+        embed = discord.Embed(
+            title=f"📋 Анкета — {t['name']} (#{tid})",
+            color=config.EMBED_COLOR,
+        )
+
+        if not questions:
+            embed.description = "Анкета пуста. Добавьте вопросы через `/tournament questions add`."
+        else:
+            lines = []
+            for q in questions:
+                req = "обязательный" if q.get("required") else "необязательный"
+                lines.append(f"**{q['position']+1}.** {q['question_text']} _({req})_")
+            embed.description = "\n".join(lines)
+
+        max_q = 4 if t["team_size"] == 1 else 3
+        embed.set_footer(text=f"Вопросов: {len(questions)}/{max_q}")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- /tournament questions clear ---
+
+    @questions_grp.command(name="clear", description="Очистить все вопросы анкеты турнира")
+    @app_commands.describe(tournament="Турнир")
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def questions_clear(
+        self,
+        interaction: discord.Interaction,
+        tournament: str,
+    ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
             return
 
-        await _generate_matches(tournament_id)
-        await db.tournament_set_status(tournament_id, "closed")
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
+            return
+
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        count = await db.question_clear(tid)
+        await _update_panel_by_tournament(interaction.client, tid)
 
         await interaction.response.send_message(
-            f"✅ Сетка турнира **{tournament['name']}** сгенерирована! "
-            f"Одобренных команд: {len(approved)}. Используйте `/lobbylist {tournament_id}` для просмотра."
+            f"✅ Удалено {count} вопросов из анкеты турнира **{t['name']}**.",
+            ephemeral=True,
+        )
+
+    # --- /tournament list ---
+
+    @tournament.command(name="list", description="Список турниров сервера")
+    async def tournament_list(self, interaction: discord.Interaction) -> None:
+        tournaments = await db.tournament_list(interaction.guild_id)
+
+        if not tournaments:
+            await interaction.response.send_message("📋 Нет турниров.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="🏆 Турниры сервера", color=config.EMBED_COLOR)
+
+        status_emoji = {
+            "open": "🟢", "closed": "🔒", "bracket": "⚔️", "finished": "🏆"
+        }
+
+        for t in tournaments[:10]:
+            fmt = _format_str(t["team_size"], t.get("is_team_dm", 0))
+            emoji = status_emoji.get(t["status"], "❓")
+            max_str = str(t["max_teams"]) if t["max_teams"] > 0 else "∞"
+            embed.add_field(
+                name=f"{emoji} {t['name']} (#{t['id']})",
+                value=f"Формат: {fmt} | Команд: {max_str} | Статус: {t['status']}",
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- /tournament panel ---
+
+    @tournament.command(name="panel", description="Показать интерактивную панель турнира")
+    @app_commands.describe(tournament="Турнир")
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def tournament_panel(
+        self,
+        interaction: discord.Interaction,
+        tournament: str,
+    ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
+            return
+
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
+            return
+
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        # Строим панель
+        result = await _build_panel(tid, t)
+        embed = result[0]
+
+        if t["status"] in ("bracket", "finished") and len(result) == 3:
+            file = result[1]
+            view = result[2]
+            msg = await interaction.channel.send(embed=embed, file=file, view=view)  # type: ignore
+        else:
+            view = result[1]
+            msg = await interaction.channel.send(embed=embed, view=view)  # type: ignore
+
+        # Сохраняем ID панели
+        await db.tournament_set_panel(tid, interaction.channel_id, msg.id)
+
+        await interaction.response.send_message(
+            f"✅ Панель турнира **{t['name']}** опубликована!", ephemeral=True
+        )
+
+    # --- /tournament delete ---
+
+    @tournament.command(name="delete", description="Удалить турнир")
+    @app_commands.describe(tournament="Турнир")
+    @app_commands.autocomplete(tournament=_tournament_autocomplete)
+    async def tournament_delete(
+        self,
+        interaction: discord.Interaction,
+        tournament: str,
+    ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
+            return
+
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
+            return
+
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        # Удаляем панель
+        if t.get("panel_message_id"):
+            try:
+                channel = interaction.client.get_channel(t["channel_id"])
+                if channel:
+                    msg = await channel.fetch_message(t["panel_message_id"])  # type: ignore
+                    await msg.delete()
+            except Exception:
+                pass
+
+        await db.tournament_delete(tid)
+        await interaction.response.send_message(
+            f"🗑 Турнир **{t['name']}** удалён.", ephemeral=True
         )
 
 

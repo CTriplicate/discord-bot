@@ -5,7 +5,6 @@
 
 import aiosqlite
 import json
-from datetime import datetime
 from pathlib import Path
 
 from config import DATABASE
@@ -23,13 +22,13 @@ CREATE TABLE IF NOT EXISTS warnings (
     guild_id        INTEGER NOT NULL,
     moderator_id    INTEGER NOT NULL,
     reason          TEXT DEFAULT '',
-    roles_given     TEXT DEFAULT '[]',      -- JSON: список role_id
+    roles_given     TEXT DEFAULT '[]',
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS warning_config (
     guild_id        INTEGER PRIMARY KEY,
-    roles           TEXT DEFAULT '[]'       -- JSON: список role_id
+    roles           TEXT DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS rolls (
@@ -38,7 +37,7 @@ CREATE TABLE IF NOT EXISTS rolls (
     channel_id      INTEGER NOT NULL,
     message_id      INTEGER DEFAULT 0,
     prize_text      TEXT DEFAULT '',
-    end_time        REAL NOT NULL,          -- Unix timestamp
+    end_time        REAL NOT NULL,
     active          INTEGER DEFAULT 1,
     created_at      TEXT DEFAULT (datetime('now'))
 );
@@ -54,11 +53,13 @@ CREATE TABLE IF NOT EXISTS tournaments (
     guild_id        INTEGER NOT NULL,
     channel_id      INTEGER NOT NULL,
     name            TEXT NOT NULL,
-    team_size       INTEGER DEFAULT 1,       -- 1=solo, 2=duo, 3=trio и т.д.
-    is_team_dm      INTEGER DEFAULT 0,       -- 0=нет, 1=да (командное дм)
-    max_teams       INTEGER DEFAULT 0,       -- 0=без лимита
-    criteria        TEXT DEFAULT '',          -- критерии прохождения
-    status          TEXT DEFAULT 'open',      -- open / closed / finished
+    team_size       INTEGER DEFAULT 1,
+    is_team_dm      INTEGER DEFAULT 0,
+    max_teams       INTEGER DEFAULT 0,
+    criteria        TEXT DEFAULT '',
+    status          TEXT DEFAULT 'open',
+    description     TEXT DEFAULT '',
+    panel_message_id INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -66,20 +67,22 @@ CREATE TABLE IF NOT EXISTS teams (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     tournament_id   INTEGER NOT NULL,
     name            TEXT NOT NULL,
-    members         TEXT DEFAULT '[]',        -- JSON: список user_id
+    members         TEXT DEFAULT '[]',
     approved        INTEGER DEFAULT 0,
+    seed            INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS matches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     tournament_id   INTEGER NOT NULL,
-    team1_id        INTEGER NOT NULL,
-    team2_id        INTEGER DEFAULT 0,        -- 0 = пока нет соперника (bye)
+    team1_id        INTEGER DEFAULT 0,
+    team2_id        INTEGER DEFAULT 0,
     round           INTEGER DEFAULT 1,
     match_index     INTEGER DEFAULT 0,
     winner_id       INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'pending',   -- pending / playing / completed
+    score           TEXT DEFAULT '',
+    status          TEXT DEFAULT 'pending',
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -87,18 +90,41 @@ CREATE TABLE IF NOT EXISTS applications (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     tournament_id   INTEGER NOT NULL,
     user_id         INTEGER NOT NULL,
-    answers         TEXT DEFAULT '{}',        -- JSON: {вопрос: ответ}
-    status          TEXT DEFAULT 'pending',   -- pending / approved / rejected
+    team_name       TEXT DEFAULT '',
+    answers         TEXT DEFAULT '{}',
+    status          TEXT DEFAULT 'pending',
     created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tournament_questions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id   INTEGER NOT NULL,
+    question_text   TEXT NOT NULL,
+    position        INTEGER DEFAULT 0,
+    required        INTEGER DEFAULT 1
 );
 """
 
+# Миграции для существующих баз
+MIGRATIONS = [
+    "ALTER TABLE tournaments ADD COLUMN panel_message_id INTEGER DEFAULT 0",
+]
+
 
 async def init_db() -> None:
-    """Создаёт таблицы, если их ещё нет."""
+    """Создаёт таблицы, если их ещё нет. Применяет миграции."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         await db.commit()
+
+    # Миграции (безопасные — игнорируем, если колонка уже есть)
+    for migration in MIGRATIONS:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(migration)
+                await db.commit()
+        except aiosqlite.OperationalError:
+            pass  # Колонка уже существует
 
 
 def _connection() -> aiosqlite.Connection:
@@ -110,11 +136,7 @@ def _connection() -> aiosqlite.Connection:
 # ===========================================================================
 
 async def warning_add(
-    user_id: int,
-    guild_id: int,
-    moderator_id: int,
-    reason: str,
-    roles_given: list[int],
+    user_id: int, guild_id: int, moderator_id: int, reason: str, roles_given: list[int]
 ) -> int:
     async with _connection() as db:
         cursor = await db.execute(
@@ -224,7 +246,6 @@ async def roll_get_active(guild_id: int) -> list[dict]:
 
 
 async def roll_participant_add(roll_id: int, user_id: int) -> bool:
-    """Возвращает True если участник добавлен, False если уже был."""
     async with _connection() as db:
         try:
             await db.execute(
@@ -270,23 +291,18 @@ async def roll_delete(roll_id: int) -> bool:
 
 
 # ===========================================================================
-# TOURNAMENT / TEAMS / MATCHES / APPLICATIONS
+# TOURNAMENT
 # ===========================================================================
 
 async def tournament_create(
-    guild_id: int,
-    channel_id: int,
-    name: str,
-    team_size: int,
-    is_team_dm: bool,
-    max_teams: int,
-    criteria: str,
+    guild_id: int, channel_id: int, name: str, team_size: int,
+    is_team_dm: bool, max_teams: int, description: str,
 ) -> int:
     async with _connection() as db:
         cursor = await db.execute(
             "INSERT INTO tournaments (guild_id, channel_id, name, team_size, "
-            "is_team_dm, max_teams, criteria) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (guild_id, channel_id, name, team_size, int(is_team_dm), max_teams, criteria),
+            "is_team_dm, max_teams, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, name, team_size, int(is_team_dm), max_teams, description),
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore
@@ -311,6 +327,24 @@ async def tournament_list(guild_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def tournament_list_by_format(guild_id: int, team_size: int, status: str = "open") -> list[dict]:
+    """Возвращает турниры по формату (team_size) и статусу."""
+    async with _connection() as db:
+        db.row_factory = aiosqlite.Row
+        if team_size == 0:
+            # custom = team_size >= 4
+            rows = await db.execute_fetchall(
+                "SELECT * FROM tournaments WHERE guild_id = ? AND status = ? AND team_size >= 4 ORDER BY created_at DESC",
+                (guild_id, status),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM tournaments WHERE guild_id = ? AND status = ? AND team_size = ? ORDER BY created_at DESC",
+                (guild_id, status, team_size),
+            )
+    return [dict(r) for r in rows]
+
+
 async def tournament_set_status(tournament_id: int, status: str) -> None:
     async with _connection() as db:
         await db.execute(
@@ -319,11 +353,99 @@ async def tournament_set_status(tournament_id: int, status: str) -> None:
         await db.commit()
 
 
-async def team_create(tournament_id: int, name: str, members: list[int]) -> int:
+async def tournament_set_panel(tournament_id: int, channel_id: int, message_id: int) -> None:
+    """Сохраняет ID сообщения-панели турнира."""
+    async with _connection() as db:
+        await db.execute(
+            "UPDATE tournaments SET channel_id = ?, panel_message_id = ? WHERE id = ?",
+            (channel_id, message_id, tournament_id),
+        )
+        await db.commit()
+
+
+async def tournament_delete(tournament_id: int) -> bool:
+    async with _connection() as db:
+        await db.execute("DELETE FROM tournament_questions WHERE tournament_id = ?", (tournament_id,))
+        await db.execute("DELETE FROM applications WHERE tournament_id = ?", (tournament_id,))
+        await db.execute("DELETE FROM matches WHERE tournament_id = ?", (tournament_id,))
+        await db.execute("DELETE FROM teams WHERE tournament_id = ?", (tournament_id,))
+        cursor = await db.execute("DELETE FROM tournaments WHERE id = ?", (tournament_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+# ===========================================================================
+# TOURNAMENT QUESTIONS
+# ===========================================================================
+
+async def question_add(tournament_id: int, question_text: str, required: bool = True) -> int:
+    """Добавляет вопрос в анкету турнира. Позиция = max+1."""
+    async with _connection() as db:
+        # Получаем максимальную позицию
+        cursor = await db.execute(
+            "SELECT COALESCE(MAX(position), -1) FROM tournament_questions WHERE tournament_id = ?",
+            (tournament_id,),
+        )
+        row = await cursor.fetchone()
+        max_pos = row[0] + 1  # type: ignore
+
+        cursor = await db.execute(
+            "INSERT INTO tournament_questions (tournament_id, question_text, position, required) "
+            "VALUES (?, ?, ?, ?)",
+            (tournament_id, question_text, max_pos, int(required)),
+        )
+        await db.commit()
+        return cursor.lastrowid  # type: ignore
+
+
+async def question_remove(question_id: int) -> bool:
     async with _connection() as db:
         cursor = await db.execute(
-            "INSERT INTO teams (tournament_id, name, members) VALUES (?, ?, ?)",
-            (tournament_id, name, json.dumps(members)),
+            "DELETE FROM tournament_questions WHERE id = ?", (question_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def question_list(tournament_id: int) -> list[dict]:
+    async with _connection() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM tournament_questions WHERE tournament_id = ? ORDER BY position",
+            (tournament_id,),
+        )
+    return [dict(r) for r in rows]
+
+
+async def question_clear(tournament_id: int) -> int:
+    """Удаляет все вопросы турнира. Возвращает количество удалённых."""
+    async with _connection() as db:
+        cursor = await db.execute(
+            "DELETE FROM tournament_questions WHERE tournament_id = ?", (tournament_id,)
+        )
+        await db.commit()
+        return cursor.rowcount  # type: ignore
+
+
+async def question_count(tournament_id: int) -> int:
+    async with _connection() as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM tournament_questions WHERE tournament_id = ?",
+            (tournament_id,),
+        )
+        row = await cursor.fetchone()
+    return row[0]  # type: ignore
+
+
+# ===========================================================================
+# TEAMS
+# ===========================================================================
+
+async def team_create(tournament_id: int, name: str, members: list[int], seed: int = 0) -> int:
+    async with _connection() as db:
+        cursor = await db.execute(
+            "INSERT INTO teams (tournament_id, name, members, seed) VALUES (?, ?, ?, ?)",
+            (tournament_id, name, json.dumps(members), seed),
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore
@@ -340,7 +462,7 @@ async def team_list(tournament_id: int) -> list[dict]:
     async with _connection() as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
-            "SELECT * FROM teams WHERE tournament_id = ? ORDER BY created_at",
+            "SELECT * FROM teams WHERE tournament_id = ? ORDER BY seed, created_at",
             (tournament_id,),
         )
     return [dict(r) for r in rows]
@@ -348,10 +470,6 @@ async def team_list(tournament_id: int) -> list[dict]:
 
 async def team_delete(team_id: int) -> bool:
     async with _connection() as db:
-        # Удаляем матчи с этой командой
-        await db.execute(
-            "DELETE FROM matches WHERE team1_id = ? OR team2_id = ?", (team_id, team_id)
-        )
         cursor = await db.execute("DELETE FROM teams WHERE id = ?", (team_id,))
         await db.commit()
         return cursor.rowcount > 0
@@ -365,12 +483,21 @@ async def team_set_approved(team_id: int, approved: bool) -> None:
         await db.commit()
 
 
+async def team_set_seed(team_id: int, seed: int) -> None:
+    async with _connection() as db:
+        await db.execute(
+            "UPDATE teams SET seed = ? WHERE id = ?", (seed, team_id)
+        )
+        await db.commit()
+
+
+# ===========================================================================
+# MATCHES
+# ===========================================================================
+
 async def match_create(
-    tournament_id: int,
-    team1_id: int,
-    team2_id: int,
-    round_num: int,
-    match_index: int,
+    tournament_id: int, team1_id: int, team2_id: int,
+    round_num: int, match_index: int,
 ) -> int:
     async with _connection() as db:
         cursor = await db.execute(
@@ -380,6 +507,13 @@ async def match_create(
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore
+
+
+async def match_get(match_id: int) -> dict | None:
+    async with _connection() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall("SELECT * FROM matches WHERE id = ?", (match_id,))
+    return dict(rows[0]) if rows else None
 
 
 async def match_list(tournament_id: int) -> list[dict]:
@@ -409,13 +543,42 @@ async def match_set_winner(match_id: int, winner_id: int) -> None:
         await db.commit()
 
 
+async def match_set_score(match_id: int, score: str) -> None:
+    async with _connection() as db:
+        await db.execute(
+            "UPDATE matches SET score = ? WHERE id = ?", (score, match_id)
+        )
+        await db.commit()
+
+
+async def match_update_team(match_id: int, slot: str, team_id: int) -> None:
+    """Обновляет team1_id или team2_id в матче."""
+    if slot not in ("team1_id", "team2_id"):
+        return
+    async with _connection() as db:
+        await db.execute(
+            f"UPDATE matches SET {slot} = ? WHERE id = ?", (team_id, match_id)
+        )
+        await db.commit()
+
+
+async def match_delete_for_tournament(tournament_id: int) -> None:
+    async with _connection() as db:
+        await db.execute("DELETE FROM matches WHERE tournament_id = ?", (tournament_id,))
+        await db.commit()
+
+
+# ===========================================================================
+# APPLICATIONS
+# ===========================================================================
+
 async def application_create(
-    tournament_id: int, user_id: int, answers: dict
+    tournament_id: int, user_id: int, team_name: str, answers: dict
 ) -> int:
     async with _connection() as db:
         cursor = await db.execute(
-            "INSERT INTO applications (tournament_id, user_id, answers) VALUES (?, ?, ?)",
-            (tournament_id, user_id, json.dumps(answers, ensure_ascii=False)),
+            "INSERT INTO applications (tournament_id, user_id, team_name, answers) VALUES (?, ?, ?, ?)",
+            (tournament_id, user_id, team_name, json.dumps(answers, ensure_ascii=False)),
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore
@@ -442,3 +605,10 @@ async def application_set_status(app_id: int, status: str) -> None:
             "UPDATE applications SET status = ? WHERE id = ?", (status, app_id)
         )
         await db.commit()
+
+
+async def application_get(app_id: int) -> dict | None:
+    async with _connection() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall("SELECT * FROM applications WHERE id = ?", (app_id,))
+    return dict(rows[0]) if rows else None

@@ -17,11 +17,10 @@
   /tournament panel             — показать интерактивную панель
   /tournament delete            — удалить турнир
 
-Панель турнира — одно сообщение с кнопками, обновляется по этапам:
-  OPEN    → [📝 Записаться] [📋 Команды] [⚙️ Управление]
-  CLOSED  → [⚙️ Управление] (генерация сетки / удаление)
-  BRACKET → [🔄 Обновить] [⚔️ Запустить] [🏆 Победитель]
-  FINISHED → автоматически после финального матча
+Многошаговая регистрация:
+  1v1:  Модалка (никнейм + до 5 вопросов) → ещё модалки по 5 вопросов → регистрация
+  Командный: UserSelect (выбор участников) → Модалка (название + до 4 вопросов)
+             → ещё модалки по 5 вопросов → регистрация
 """
 
 from __future__ import annotations
@@ -73,11 +72,11 @@ def _format_str(team_size: int, is_team_dm: bool = False) -> str:
 
 
 # ===========================================================================
-# МОДАЛКА РЕГИСТРАЦИИ
+# SESSION — состояние многошаговой регистрации
 # ===========================================================================
 
-class RegisterModal(discord.ui.Modal, title="Регистрация на турнир"):
-    """Модалка регистрации: название, участники, ответы на анкету."""
+class RegistrationSession:
+    """Хранит промежуточные данные между шагами регистрации."""
 
     def __init__(
         self,
@@ -87,15 +86,128 @@ class RegisterModal(discord.ui.Modal, title="Регистрация на тур�
         channel_id: int,
         panel_message_id: int,
     ) -> None:
-        super().__init__()
         self.tournament_id = tournament_id
         self.team_size = team_size
         self.questions = questions
         self.channel_id = channel_id
         self.panel_message_id = panel_message_id
+        self.team_name: str = ""
+        self.members: list[int] = []
+        self.answers: dict[str, str] = {}
 
-        # --- Поле «Название команды» ---
-        if team_size > 1:
+
+# ===========================================================================
+# ШАГ 1 (командный): ВЫБОР УЧАСТНИКОВ ЧЕРЕЗ UserSelect
+# ===========================================================================
+
+class MemberSelectView(discord.ui.View):
+    """View с UserSelect для выбора участников команды."""
+
+    def __init__(self, session: RegistrationSession) -> None:
+        super().__init__(timeout=120)
+        needed = session.team_size - 1
+        self.add_item(MemberUserSelect(needed, session))
+        self.add_item(CancelRegButton(session))
+
+
+class MemberUserSelect(discord.ui.UserSelect):
+    """Выпадающий список участников сервера для добавления в команду."""
+
+    def __init__(self, needed: int, session: RegistrationSession) -> None:
+        self.session = session
+        super().__init__(
+            placeholder=f"Выберите {needed} участников команды...",
+            min_values=needed,
+            max_values=needed,
+            custom_id="member_user_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        # Собираем выбранных участников
+        selected_ids = [u.id for u in self.values]
+        self.session.members = [interaction.user.id] + selected_ids
+
+        # Проверяем пересечения с другими командами
+        existing_teams = await db.team_list(self.session.tournament_id)
+        for t in existing_teams:
+            existing_members = json.loads(t["members"])
+            overlap = set(self.session.members) & set(existing_members)
+            if overlap:
+                overlap_mentions = " ".join(f"<@{uid}>" for uid in overlap)
+                await interaction.response.send_message(
+                    f"⚠️ {overlap_mentions} уже в команде **{t['name']}**. Выберите других.",
+                    ephemeral=True,
+                )
+                return
+
+        # Следующий шаг — модалка с названием + вопросы
+        await _show_next_modal(interaction, self.session)
+
+
+class CancelRegButton(discord.ui.Button):
+    """Кнопка отмены регистрации."""
+
+    def __init__(self, session: RegistrationSession) -> None:
+        self.session = session
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="❌ Отмена",
+            custom_id="cancel_reg",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content="❌ Регистрация отменена.", view=None,
+        )
+
+
+# ===========================================================================
+# МОДАЛКИ — НАЗВАНИЕ + ВОПРОСЫ (многошаговые, по 5 вопросов за раз)
+# ===========================================================================
+
+async def _show_next_modal(interaction: discord.Interaction, session: RegistrationSession) -> None:
+    """Определяет, какую модалку показать следующей, или завершает регистрацию."""
+
+    # Сколько ответов уже собрано
+    answered = len(session.answers)
+
+    if answered == 0:
+        # Первая модалка — включаем поле названия + первые вопросы
+        if session.team_size > 1:
+            # Командная: название + до 4 вопросов
+            name_field = True
+            max_q = 4
+        else:
+            # 1v1: никнейм + до 5 вопросов
+            name_field = True
+            max_q = 5
+
+        remaining = session.questions[answered:answered + max_q]
+        modal = TeamNameQuestionsModal(session, remaining, name_field)
+        await interaction.response.send_modal(modal)
+
+    else:
+        # Последующие модалки — только вопросы (по 5 штук)
+        remaining = session.questions[answered:answered + 5]
+        if not remaining:
+            # Вопросов больше нет — финализируем регистрацию
+            await _finalize_registration(interaction, session)
+            return
+
+        modal = QuestionsOnlyModal(session, remaining)
+        await interaction.response.send_modal(modal)
+
+
+class TeamNameQuestionsModal(discord.ui.Modal, title="Регистрация на турнир"):
+    """Первая модалка: название/никнейм + первые вопросы анкеты."""
+
+    def __init__(self, session: RegistrationSession, questions: list[dict], name_field: bool) -> None:
+        super().__init__()
+        self.session = session
+        self.questions = questions
+
+        # Поле названия
+        if session.team_size > 1:
             self.add_item(discord.ui.TextInput(
                 label="Название команды",
                 placeholder="Введите название вашей команды",
@@ -112,24 +224,10 @@ class RegisterModal(discord.ui.Modal, title="Регистрация на тур�
                 custom_id="team_name",
             ))
 
-        # --- Поле «Участники» — только для командных турниров ---
-        if team_size > 1:
-            needed = team_size - 1
+        # Вопросы
+        for i, q in enumerate(questions):
             self.add_item(discord.ui.TextInput(
-                label=f"Участники (упомяните {needed} чел.)",
-                placeholder="@user1 @user2 @user3",
-                style=discord.TextStyle.paragraph,
-                max_length=300,
-                required=True,
-                custom_id="members",
-            ))
-
-        # --- Вопросы анкеты ---
-        max_q = 3 if team_size > 1 else 4  # Лимит полей модалки (5 шт.)
-        for i, q in enumerate(questions[:max_q]):
-            label_text = q["question_text"][:45]
-            self.add_item(discord.ui.TextInput(
-                label=label_text,
+                label=q["question_text"][:45],
                 placeholder=q["question_text"],
                 style=discord.TextStyle.paragraph,
                 max_length=500,
@@ -138,109 +236,132 @@ class RegisterModal(discord.ui.Modal, title="Регистрация на тур�
             ))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # --- Собираем данные ---
+        # Собираем данные
         team_name_raw = ""
-        members_raw = ""
-        answers: dict[str, str] = {}
-
         for child in self.children:
             if not isinstance(child, discord.ui.TextInput):
                 continue
             if child.custom_id == "team_name":
                 team_name_raw = child.value.strip()
-            elif child.custom_id == "members":
-                members_raw = child.value.strip()
             elif child.custom_id and child.custom_id.startswith("question_"):
-                answers[child.label] = child.value
+                self.session.answers[child.label] = child.value
 
-        # --- Проверки ---
-        tournament = await db.tournament_get(self.tournament_id)
+        # Сохраняем название
+        if self.session.team_size > 1:
+            if not team_name_raw:
+                await interaction.response.send_message(
+                    "❌ Укажите название команды!", ephemeral=True
+                )
+                return
+            self.session.team_name = team_name_raw
+        else:
+            self.session.team_name = team_name_raw or interaction.user.display_name
+            self.session.members = [interaction.user.id]
+
+        # Проверяем, что турнир ещё открыт
+        tournament = await db.tournament_get(self.session.tournament_id)
         if not tournament or tournament["status"] != "open":
             await interaction.response.send_message(
                 "❌ Турнир закрыт для регистрации.", ephemeral=True
             )
             return
 
-        existing_teams = await db.team_list(self.tournament_id)
-        if tournament["max_teams"] > 0 and len(existing_teams) >= tournament["max_teams"]:
+        # Следующий шаг
+        await _show_next_modal(interaction, self.session)
+
+
+class QuestionsOnlyModal(discord.ui.Modal, title="Анкета — продолжение"):
+    """Последующие модалки: только вопросы (по 5 штук)."""
+
+    def __init__(self, session: RegistrationSession, questions: list[dict]) -> None:
+        super().__init__()
+        self.session = session
+        self.questions = questions
+
+        remaining_count = len(session.questions) - len(session.answers)
+        self.title = f"Анкета ({remaining_count} вопр. осталось)"
+
+        for i, q in enumerate(questions):
+            self.add_item(discord.ui.TextInput(
+                label=q["question_text"][:45],
+                placeholder=q["question_text"],
+                style=discord.TextStyle.paragraph,
+                max_length=500,
+                required=bool(q.get("required", 1)),
+                custom_id=f"question_{i}",
+            ))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Собираем ответы
+        for child in self.children:
+            if not isinstance(child, discord.ui.TextInput):
+                continue
+            if child.custom_id and child.custom_id.startswith("question_"):
+                self.session.answers[child.label] = child.value
+
+        # Следующий шаг
+        await _show_next_modal(interaction, self.session)
+
+
+# ===========================================================================
+# ФИНАЛИЗАЦИЯ РЕГИСТРАЦИИ
+# ===========================================================================
+
+async def _finalize_registration(interaction: discord.Interaction, session: RegistrationSession) -> None:
+    """Создаёт команду и анкету в БД, обновляет панель."""
+
+    tournament = await db.tournament_get(session.tournament_id)
+    if not tournament or tournament["status"] != "open":
+        await interaction.response.send_message(
+            "❌ Турнир закрыт для регистрации.", ephemeral=True
+        )
+        return
+
+    # Проверяем лимит команд
+    existing_teams = await db.team_list(session.tournament_id)
+    if tournament["max_teams"] > 0 and len(existing_teams) >= tournament["max_teams"]:
+        await interaction.response.send_message(
+            "❌ Достигнут лимит команд.", ephemeral=True
+        )
+        return
+
+    # Проверяем, не в команде ли уже
+    for t in existing_teams:
+        member_ids = json.loads(t["members"])
+        if interaction.user.id in member_ids:
             await interaction.response.send_message(
-                "❌ Достигнут лимит команд.", ephemeral=True
+                "⚠️ Вы уже состоите в команде на этом турнире.", ephemeral=True
             )
             return
 
-        # Проверяем, не в команде ли уже
-        for t in existing_teams:
-            member_ids = json.loads(t["members"])
-            if interaction.user.id in member_ids:
-                await interaction.response.send_message(
-                    "⚠️ Вы уже состоите в команде на этом турнире.", ephemeral=True
-                )
-                return
+    # Для 1v1 — автодобрение
+    auto_approve = session.team_size == 1
 
-        # --- Обработка 1v1 ---
-        if self.team_size == 1:
-            team_name = team_name_raw or interaction.user.display_name
-            tid = await db.team_create(self.tournament_id, team_name, [interaction.user.id])
-            await db.team_set_approved(tid, True)
+    # Создаём команду
+    tid = await db.team_create(session.tournament_id, session.team_name, session.members)
+    if auto_approve:
+        await db.team_set_approved(tid, True)
 
-            if answers:
-                await db.application_create(
-                    self.tournament_id, interaction.user.id, team_name, answers
-                )
+    # Сохраняем анкету
+    if session.answers:
+        await db.application_create(
+            session.tournament_id, interaction.user.id, session.team_name, session.answers
+        )
 
-            await interaction.response.send_message(
-                f"✅ Вы записаны как **{team_name}**!", ephemeral=True
-            )
-        else:
-            # --- Обработка командного ---
-            if not team_name_raw:
-                await interaction.response.send_message(
-                    "❌ Укажите название команды!", ephemeral=True
-                )
-                return
+    # Ответ пользователю
+    if auto_approve:
+        await interaction.response.send_message(
+            f"✅ Вы записаны как **{session.team_name}**!", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"✅ Команда **{session.team_name}** зарегистрирована! "
+            f"Ожидайте одобрения от администрации.",
+            ephemeral=True,
+        )
 
-            # Парсим участников из упоминаний
-            member_ids: list[int] = [interaction.user.id]
-            for match in re.findall(r"<@!?(\d+)>", members_raw):
-                member_ids.append(int(match))
-            member_ids = list(dict.fromkeys(member_ids))
-
-            if len(member_ids) < self.team_size:
-                await interaction.response.send_message(
-                    f"❌ Нужно {self.team_size} участников. Указано: {len(member_ids)}.",
-                    ephemeral=True,
-                )
-                return
-
-            member_ids = member_ids[:self.team_size]
-
-            # Проверяем пересечения с другими командами
-            for t in existing_teams:
-                existing_members = json.loads(t["members"])
-                overlap = set(member_ids) & set(existing_members)
-                if overlap:
-                    overlap_mentions = " ".join(f"<@{uid}>" for uid in overlap)
-                    await interaction.response.send_message(
-                        f"⚠️ {overlap_mentions} уже в команде **{t['name']}**.",
-                        ephemeral=True,
-                    )
-                    return
-
-            tid = await db.team_create(self.tournament_id, team_name_raw, member_ids)
-
-            if answers:
-                await db.application_create(
-                    self.tournament_id, interaction.user.id, team_name_raw, answers
-                )
-
-            await interaction.response.send_message(
-                f"✅ Команда **{team_name_raw}** зарегистрирована! "
-                f"Ожидайте одобрения от администрации.",
-                ephemeral=True,
-            )
-
-        # --- Обновляем панель ---
-        await _update_panel_by_tournament(interaction.client, self.tournament_id)  # type: ignore
+    # Обновляем панель
+    await _update_panel_by_tournament(interaction.client, session.tournament_id)  # type: ignore
 
 
 # ===========================================================================
@@ -284,22 +405,41 @@ class TournamentSelect(discord.ui.Select):
             )
             return
 
-        # Загружаем вопросы
-        questions = await db.question_list(tournament_id)
+        await _start_registration(interaction, tournament)
 
-        # Проверяем лимит вопросов для модалки
-        max_q = 3 if self.team_size > 1 else 4
-        if len(questions) > max_q:
-            questions = questions[:max_q]
 
-        modal = RegisterModal(
-            tournament_id=tournament_id,
-            team_size=self.team_size,
-            questions=questions,
-            channel_id=tournament.get("channel_id", 0),
-            panel_message_id=tournament.get("panel_message_id", 0),
+async def _start_registration(interaction: discord.Interaction, tournament: dict) -> None:
+    """Начинает процесс регистрации: UserSelect (для командных) или модалка (для 1v1)."""
+
+    questions = await db.question_list(tournament["id"])
+
+    session = RegistrationSession(
+        tournament_id=tournament["id"],
+        team_size=tournament["team_size"],
+        questions=questions,
+        channel_id=tournament.get("channel_id", 0),
+        panel_message_id=tournament.get("panel_message_id", 0),
+    )
+
+    if tournament["team_size"] > 1:
+        # Командный турнир — сначала выбор участников через UserSelect
+        view = MemberSelectView(session)
+
+        needed = tournament["team_size"] - 1
+        embed = discord.Embed(
+            title="👥 Выбор участников",
+            description=(
+                f"Турнир: **{tournament['name']}**\n"
+                f"Формат: {_format_str(tournament['team_size'], tournament.get('is_team_dm', 0))}\n\n"
+                f"Выберите **{needed} участников** из списка ниже.\n"
+                f"Вы автоматически будете добавлены как капитан."
+            ),
+            color=config.EMBED_COLOR,
         )
-        await interaction.response.send_modal(modal)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    else:
+        # 1v1 — сразу модалка
+        await _show_next_modal(interaction, session)
 
 
 # ===========================================================================
@@ -318,7 +458,7 @@ class OpenView(discord.ui.View):
 
 
 class JoinButton(discord.ui.Button):
-    """📝 Записаться — открывает выбор турнира, затем модалку."""
+    """📝 Записаться — начинает процесс регистрации."""
 
     def __init__(self, tournament_id: int, team_size: int,
                  channel_id: int, panel_message_id: int) -> None:
@@ -340,19 +480,7 @@ class JoinButton(discord.ui.Button):
             )
             return
 
-        questions = await db.question_list(self.tournament_id)
-        max_q = 3 if self.team_size > 1 else 4
-        if len(questions) > max_q:
-            questions = questions[:max_q]
-
-        modal = RegisterModal(
-            tournament_id=self.tournament_id,
-            team_size=self.team_size,
-            questions=questions,
-            channel_id=self.channel_id,
-            panel_message_id=self.panel_message_id,
-        )
-        await interaction.response.send_modal(modal)
+        await _start_registration(interaction, tournament)
 
 
 class TeamsButton(discord.ui.Button):
@@ -816,7 +944,6 @@ class DeleteTournamentButton(discord.ui.Button):
         await db.tournament_delete(self.tournament_id)
         await interaction.response.edit_message(content="🗑 Турнир удалён.", view=None)
 
-        # Пытаемся удалить панель
         tournament = await db.tournament_get(self.tournament_id)
         if tournament and tournament.get("panel_message_id"):
             try:
@@ -989,7 +1116,6 @@ async def _do_start_match(interaction: discord.Interaction, match_id: int) -> No
 
     await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-    # Уведомляем участников в канале
     await _update_panel_by_tournament(interaction.client, match_data["tournament_id"])  # type: ignore
 
 
@@ -1033,7 +1159,6 @@ async def _do_set_winner(interaction: discord.Interaction, match_id: int, winner
         color=config.EMBED_COLOR,
     )
 
-    # Продвигаем победителя по сетке
     tournament_id = match_data["tournament_id"]
     next_round = match_data["round"] + 1
     next_match_idx = match_data["match_index"] // 2
@@ -1055,7 +1180,6 @@ async def _do_set_winner(interaction: discord.Interaction, match_id: int, winner
 
     await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-    # Обновляем панель
     await _update_panel_by_tournament(interaction.client, tournament_id)  # type: ignore
 
 
@@ -1071,26 +1195,20 @@ async def _generate_bracket(tournament_id: int) -> None:
     if len(approved) < 2:
         return
 
-    # Очищаем старые матчи
     await db.match_delete_for_tournament(tournament_id)
 
-    # Рассчитываем размер сетки (степень двойки)
     n = len(approved)
     bracket_size = 1
     while bracket_size < n:
         bracket_size *= 2
 
-    # Количество раундов
     num_rounds = int(math.log2(bracket_size))
 
-    # Перемешиваем команды для сеяния
     seeded = list(approved)
     random.shuffle(seeded)
 
-    # Рассчитываем byes
     byes = bracket_size - n
 
-    # Создаём матчи первого раунда
     match_idx = 0
     team_idx = 0
     first_round_matches = bracket_size // 2
@@ -1100,11 +1218,10 @@ async def _generate_bracket(tournament_id: int) -> None:
         t2_id = 0
 
         if i < byes:
-            # Bye: первая команда проходит автоматически
             if team_idx < n:
                 t1_id = seeded[team_idx]["id"]
                 team_idx += 1
-            t2_id = 0  # Bye
+            t2_id = 0
         else:
             if team_idx < n:
                 t1_id = seeded[team_idx]["id"]
@@ -1116,47 +1233,31 @@ async def _generate_bracket(tournament_id: int) -> None:
         await db.match_create(tournament_id, t1_id, t2_id, 1, match_idx)
         match_idx += 1
 
-    # Автоматически продвигаем команды с bye
-    matches_r1 = await db.match_list(tournament_id)
-    for m in matches_r1:
-        if m["team1_id"] and not m["team2_id"]:
-            # Bye — команда автоматически в следующем раунде
-            next_round = 2
-            next_idx = m["match_index"] // 2
-            next_matches = [mm for mm in matches_r1 if mm["round"] == next_round and mm["match_index"] == next_idx]
-            if next_matches:
-                slot = "team1_id" if m["match_index"] % 2 == 0 else "team2_id"
-                await db.match_update_team(next_matches[0]["id"], slot, m["team1_id"])
-
     # Создаём пустые матчи для последующих раундов
     for rnd in range(2, num_rounds + 1):
         matches_in_round = bracket_size // (2 ** rnd)
         for idx in range(matches_in_round):
             await db.match_create(tournament_id, 0, 0, rnd, idx)
 
-    # Заполняем команды с bye в матчи следующих раундов
+    # Обрабатываем bye — автоматическое продвижение
     all_matches = await db.match_list(tournament_id)
-    for rnd in range(2, num_rounds + 1):
+    for rnd in range(1, num_rounds + 1):
         round_matches = [m for m in all_matches if m["round"] == rnd]
-        prev_matches = [m for m in all_matches if m["round"] == rnd - 1]
+        next_round_matches = [m for m in all_matches if m["round"] == rnd + 1]
 
         for m in round_matches:
-            prev1 = next((p for p in prev_matches if p["match_index"] == m["match_index"] * 2), None)
-            prev2 = next((p for p in prev_matches if p["match_index"] == m["match_index"] * 2 + 1), None)
+            if m["team1_id"] and not m["team2_id"] and m["status"] == "pending":
+                # Bye — команда автоматически проходит дальше
+                await db.match_set_winner(m["id"], m["team1_id"])
 
-            # Если предыдущий матч завершён (bye), продвигаем команду
-            if prev1 and prev1["status"] == "completed" and prev1["winner_id"]:
-                await db.match_update_team(m["id"], "team1_id", prev1["winner_id"])
-            elif prev1 and prev1["team1_id"] and not prev1["team2_id"]:
-                # Bye в предыдущем — продвигаем автоматически
-                await db.match_set_winner(prev1["id"], prev1["team1_id"])
-                await db.match_update_team(m["id"], "team1_id", prev1["team1_id"])
-
-            if prev2 and prev2["status"] == "completed" and prev2["winner_id"]:
-                await db.match_update_team(m["id"], "team2_id", prev2["winner_id"])
-            elif prev2 and prev2["team1_id"] and not prev2["team2_id"]:
-                await db.match_set_winner(prev2["id"], prev2["team1_id"])
-                await db.match_update_team(m["id"], "team2_id", prev2["team1_id"])
+                if next_round_matches:
+                    nm = next(
+                        (nm for nm in next_round_matches if nm["match_index"] == m["match_index"] // 2),
+                        None,
+                    )
+                    if nm:
+                        slot = "team1_id" if m["match_index"] % 2 == 0 else "team2_id"
+                        await db.match_update_team(nm["id"], slot, m["team1_id"])
 
 
 # ===========================================================================
@@ -1208,12 +1309,12 @@ async def _build_registration_panel(
     embed.add_field(name="Одобрено", value=f"✅ {approved}", inline=True)
     embed.add_field(name="Ожидают", value=f"⏳ {pending}", inline=True)
 
-    # Вопросы анкеты
     if questions:
-        q_list = "\n".join(f"• {q['question_text']}" for q in questions[:10])
+        q_list = "\n".join(f"• {q['question_text']}" for q in questions[:15])
+        if len(questions) > 15:
+            q_list += f"\n... и ещё {len(questions) - 15}"
         embed.add_field(name=f"📋 Анкета ({len(questions)} вопросов)", value=q_list, inline=False)
 
-    # Список команд
     if teams:
         team_lines = []
         for t in teams[:12]:
@@ -1346,26 +1447,6 @@ class TournamentCog(commands.Cog, name="Tournament"):
                 results.append(app_commands.Choice(name=label[:100], value=str(t["id"])))
         return results[:25]
 
-    async def _question_autocomplete(
-        self, interaction: discord.Interaction, current: str,
-    ) -> list[app_commands.Choice[str]]:
-        # Получаем tournament из namespace, если он задан
-        tournament_val = interaction.namespace.get("tournament", None)
-        if not tournament_val:
-            return []
-        try:
-            tid = int(tournament_val)
-        except (ValueError, TypeError):
-            return []
-
-        questions = await db.question_list(tid)
-        results = []
-        for q in questions:
-            label = f"#{q['position']+1}: {q['question_text'][:80]}"
-            if current.lower() in label.lower():
-                results.append(app_commands.Choice(name=label[:100], value=str(q["id"])))
-        return results[:25]
-
     # -----------------------------------------------------------------------
     # /1vs1  /2vs2  /3vs3  /customlobby
     # -----------------------------------------------------------------------
@@ -1384,10 +1465,10 @@ class TournamentCog(commands.Cog, name="Tournament"):
 
     @app_commands.command(name="customlobby", description="Записаться на кастомный турнир (4v4+)")
     async def register_custom(self, interaction: discord.Interaction) -> None:
-        await self._show_tournament_select(interaction, team_size=0)  # 0 = custom (4+)
+        await self._show_tournament_select(interaction, team_size=0)
 
     async def _show_tournament_select(self, interaction: discord.Interaction, team_size: int) -> None:
-        """Показывает dropdown выбора турнира для регистрации."""
+        """Показывает dropdown выбора турнира или сразу начинает регистрацию."""
         tournaments = await db.tournament_list_by_format(
             interaction.guild_id, team_size, status="open"
         )
@@ -1401,24 +1482,11 @@ class TournamentCog(commands.Cog, name="Tournament"):
             return
 
         if len(tournaments) == 1:
-            # Только один турнир — показываем модалку сразу
-            t = tournaments[0]
-            questions = await db.question_list(t["id"])
-            max_q = 3 if t["team_size"] > 1 else 4
-            if len(questions) > max_q:
-                questions = questions[:max_q]
-
-            modal = RegisterModal(
-                tournament_id=t["id"],
-                team_size=t["team_size"],
-                questions=questions,
-                channel_id=t.get("channel_id", 0),
-                panel_message_id=t.get("panel_message_id", 0),
-            )
-            await interaction.response.send_modal(modal)
+            # Один турнир — начинаем регистрацию сразу
+            await _start_registration(interaction, tournaments[0])
         else:
-            # Несколько турниров — показываем dropdown
-            view = TournamentSelectView(tournaments, team_size if team_size else 4)
+            # Несколько турниров — dropdown
+            view = TournamentSelectView(tournaments, team_size)
             fmt_name = "1v1" if team_size == 1 else f"{team_size}v{team_size}" if team_size else "кастомный"
             embed = discord.Embed(
                 title=f"🏆 Выберите {fmt_name} турнир",
@@ -1474,13 +1542,11 @@ class TournamentCog(commands.Cog, name="Tournament"):
             await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
             return
 
-        # Определяем team_size
         if format == 0:
             actual_size = max(1, team_size)
         else:
             actual_size = format
 
-        # Создаём турнир
         tid = await db.tournament_create(
             guild_id=interaction.guild_id,
             channel_id=interaction.channel_id,
@@ -1507,7 +1573,7 @@ class TournamentCog(commands.Cog, name="Tournament"):
 
     # --- /tournament questions add ---
 
-    @questions_grp.command(name="add", description="Добавить вопрос в анкету турнира")
+    @questions_grp.command(name="add", description="Добавить вопрос в анкету турнира (без лимита)")
     @app_commands.describe(
         tournament="Турнир (введите ID или название)",
         question="Текст вопроса",
@@ -1534,20 +1600,9 @@ class TournamentCog(commands.Cog, name="Tournament"):
             await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
             return
 
-        # Проверяем лимит вопросов (макс 4 для 1v1, 3 для командных)
-        max_q = 4 if t["team_size"] == 1 else 3
-        current_count = await db.question_count(tid)
-        if current_count >= max_q:
-            await interaction.response.send_message(
-                f"❌ Лимит вопросов: {max_q} для {_format_str(t['team_size'])}. "
-                f"Уже добавлено: {current_count}.",
-                ephemeral=True,
-            )
-            return
-
         qid = await db.question_add(tid, question, required=True)
+        current_count = await db.question_count(tid)
 
-        # Обновляем панель, если она есть
         await _update_panel_by_tournament(interaction.client, tid)
 
         embed = discord.Embed(
@@ -1556,7 +1611,7 @@ class TournamentCog(commands.Cog, name="Tournament"):
             color=config.EMBED_COLOR,
         )
         embed.add_field(name="Турнир", value=f"{t['name']} (#{tid})", inline=True)
-        embed.add_field(name="Вопросов", value=f"{current_count + 1}/{max_q}", inline=True)
+        embed.add_field(name="Всего вопросов", value=str(current_count), inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1590,7 +1645,6 @@ class TournamentCog(commands.Cog, name="Tournament"):
             await interaction.response.send_message("❌ Нет вопросов для удаления.", ephemeral=True)
             return
 
-        # Показываем dropdown для выбора вопроса
         options = [
             discord.SelectOption(
                 label=f"#{q['position']+1}: {q['question_text'][:80]}",
@@ -1662,8 +1716,7 @@ class TournamentCog(commands.Cog, name="Tournament"):
                 lines.append(f"**{q['position']+1}.** {q['question_text']} _({req})_")
             embed.description = "\n".join(lines)
 
-        max_q = 4 if t["team_size"] == 1 else 3
-        embed.set_footer(text=f"Вопросов: {len(questions)}/{max_q}")
+        embed.set_footer(text=f"Вопросов: {len(questions)} (без лимита)")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1753,7 +1806,6 @@ class TournamentCog(commands.Cog, name="Tournament"):
             await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
             return
 
-        # Строим панель
         result = await _build_panel(tid, t)
         embed = result[0]
 
@@ -1765,7 +1817,6 @@ class TournamentCog(commands.Cog, name="Tournament"):
             view = result[1]
             msg = await interaction.channel.send(embed=embed, view=view)  # type: ignore
 
-        # Сохраняем ID панели
         await db.tournament_set_panel(tid, interaction.channel_id, msg.id)
 
         await interaction.response.send_message(
@@ -1797,7 +1848,6 @@ class TournamentCog(commands.Cog, name="Tournament"):
             await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
             return
 
-        # Удаляем панель
         if t.get("panel_message_id"):
             try:
                 channel = interaction.client.get_channel(t["channel_id"])

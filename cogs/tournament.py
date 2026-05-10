@@ -6,6 +6,7 @@
   /2vs2           — записаться на 2v2 турнир
   /3vs3           — записаться на 3v3 турнир
   /customlobby    — записаться на кастомный турнир (4v4 и больше)
+  /bracket        — посмотреть сетку турнира (доступна всем)
 
 Управление (для администрации):
   /tournament create            — создать турнир
@@ -16,6 +17,7 @@
   /tournament list              — список турниров сервера
   /tournament panel             — показать интерактивную панель
   /tournament delete            — удалить турнир
+  /tournament logchannel        — установить канал для логов
 
 Многошаговая регистрация:
   1v1:  Модалка (никнейм + до 4 вопросов) → кнопка «Продолжить» → ещё модалки по 5 вопросов → регистрация
@@ -69,6 +71,27 @@ def _format_str(team_size: int, is_team_dm: bool = False) -> str:
     if is_team_dm:
         s += " (Командное ДМ)"
     return s
+
+
+async def _log_event(
+    client: discord.Client,
+    guild_id: int,
+    title: str,
+    description: str,
+    color: int = 0x5865F2,
+) -> None:
+    """Отправляет embed в канал логов турнира (если настроен)."""
+    cfg = await db.tournament_config_get(guild_id)
+    if not cfg or not cfg.get("log_channel_id"):
+        return
+    channel = client.get_channel(cfg["log_channel_id"])
+    if not channel or not isinstance(channel, discord.TextChannel):
+        return
+    embed = discord.Embed(title=title, description=description, color=color)
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
 
 
 # ===========================================================================
@@ -455,6 +478,16 @@ async def _finalize_registration(interaction: discord.Interaction, session: Regi
 
     # Обновляем панель
     await _update_panel_by_tournament(interaction.client, session.tournament_id)  # type: ignore
+
+    # Логируем регистрацию
+    team_word = "Команда" if session.team_size > 1 else "Участник"
+    team_ending = "а" if session.team_size > 1 else ""
+    await _log_event(
+        interaction.client, interaction.guild_id,
+        "📝 Новая регистрация",
+        f"{team_word} **{session.team_name}** зарегистрирован{team_ending} на турнир",
+        color=config.EMBED_COLOR,
+    )
 
 
 # ===========================================================================
@@ -873,6 +906,14 @@ class ApproveSelectButton(discord.ui.Button):
             )
             await _update_panel_by_tournament(sel_interaction.client, self.tournament_id)  # type: ignore
 
+            # Логируем одобрение
+            await _log_event(
+                sel_interaction.client, sel_interaction.guild_id,
+                "✅ Команды одобрены",
+                f"Администратор {sel_interaction.user.mention} одобрил: {', '.join(approved_names)}",
+                color=0x57F287,
+            )
+
         sel.callback = _approve_cb  # type: ignore
         view = discord.ui.View(timeout=60)
         view.add_item(sel)
@@ -916,6 +957,14 @@ class RejectSelectButton(discord.ui.Button):
                 view=None,
             )
             await _update_panel_by_tournament(sel_interaction.client, self.tournament_id)  # type: ignore
+
+            # Логируем отклонение
+            await _log_event(
+                sel_interaction.client, sel_interaction.guild_id,
+                "❌ Команды отклонены",
+                f"Администратор {sel_interaction.user.mention} отклонил: {', '.join(removed_names)}",
+                color=0xED4245,
+            )
 
         sel.callback = _reject_cb  # type: ignore
         view = discord.ui.View(timeout=60)
@@ -1025,6 +1074,14 @@ class GenerateBracketButton(discord.ui.Button):
         await interaction.response.edit_message(
             content=f"✅ Сетка сгенерирована! {len(approved)} команд.",
             view=None,
+        )
+
+        # Логируем генерацию сетки
+        await _log_event(
+            interaction.client, interaction.guild_id,
+            "🏆 Сетка сгенерирована",
+            f"Турнир **{tournament['name']}**: сетка с {len(approved)} командами",
+            color=config.EMBED_COLOR,
         )
 
 
@@ -1211,6 +1268,14 @@ async def _do_start_match(interaction: discord.Interaction, match_id: int) -> No
 
     await _update_panel_by_tournament(interaction.client, match_data["tournament_id"])  # type: ignore
 
+    # Логируем старт матча
+    await _log_event(
+        interaction.client, interaction.guild_id,
+        "⚔️ Матч начат",
+        f"**{t1_name}** vs **{t2_name}** (матч #{match_id})",
+        color=0xFEE75C,
+    )
+
 
 async def _show_winner_dropdown(interaction: discord.Interaction, match_id: int) -> None:
     match_data = await db.match_get(match_id)
@@ -1274,6 +1339,14 @@ async def _do_set_winner(interaction: discord.Interaction, match_id: int, winner
     await interaction.response.edit_message(content=None, embed=embed, view=None)
 
     await _update_panel_by_tournament(interaction.client, tournament_id)  # type: ignore
+
+    # Логируем результат матча
+    await _log_event(
+        interaction.client, interaction.guild_id,
+        "🏆 Победитель матча",
+        f"**{winner_name}** побеждает **{loser_name}**",
+        color=0x57F287,
+    )
 
 
 # ===========================================================================
@@ -1540,6 +1613,21 @@ class TournamentCog(commands.Cog, name="Tournament"):
                 results.append(app_commands.Choice(name=label[:100], value=str(t["id"])))
         return results[:25]
 
+    async def _all_tournament_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete для выбора любого турнира (для /bracket)."""
+        tournaments = await db.tournament_list(interaction.guild_id)
+        results = []
+        status_emoji = {"open": "🟢", "closed": "🔒", "bracket": "⚔️", "finished": "🏆"}
+        for t in tournaments:
+            fmt = _format_str(t["team_size"], t.get("is_team_dm", 0))
+            emoji = status_emoji.get(t["status"], "❓")
+            label = f"{emoji} {t['name']} (#{t['id']}) [{fmt}]"
+            if current.lower() in label.lower():
+                results.append(app_commands.Choice(name=label[:100], value=str(t["id"])))
+        return results[:25]
+
     # -----------------------------------------------------------------------
     # /1vs1  /2vs2  /3vs3  /customlobby
     # -----------------------------------------------------------------------
@@ -1587,6 +1675,99 @@ class TournamentCog(commands.Cog, name="Tournament"):
                 color=config.EMBED_COLOR,
             )
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    # -----------------------------------------------------------------------
+    # /bracket — посмотреть сетку (доступна всем)
+    # -----------------------------------------------------------------------
+
+    @app_commands.command(name="bracket", description="Посмотреть сетку турнира")
+    @app_commands.describe(tournament="Выберите турнир")
+    @app_commands.autocomplete(tournament=_all_tournament_autocomplete)
+    async def view_bracket(self, interaction: discord.Interaction, tournament: str) -> None:
+        try:
+            tid = int(tournament)
+        except ValueError:
+            await interaction.response.send_message("❌ Неверный ID турнира.", ephemeral=True)
+            return
+
+        t = await db.tournament_get(tid)
+        if not t or t["guild_id"] != interaction.guild_id:
+            await interaction.response.send_message("❌ Турнир не найден.", ephemeral=True)
+            return
+
+        fmt = _format_str(t["team_size"], t.get("is_team_dm", 0))
+
+        if t["status"] in ("bracket", "finished"):
+            teams = await db.team_list(tid)
+            matches = await db.match_list(tid)
+
+            if matches:
+                buf = generate_bracket(teams, matches, t["name"])
+            else:
+                buf = generate_bracket_simple(teams, t["name"])
+
+            file = discord.File(buf, filename="bracket.png")
+
+            status_emoji = {"bracket": "⚔️", "finished": "🏆"}.get(t["status"], "❓")
+            status_text = {"bracket": "Идёт", "finished": "Завершён"}.get(t["status"], t["status"])
+
+            embed = discord.Embed(title=f"🏆 {t['name']}", color=config.EMBED_COLOR)
+            embed.set_image(url="attachment://bracket.png")
+            embed.add_field(name="Формат", value=fmt, inline=True)
+            embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
+
+            if matches:
+                completed = sum(1 for m in matches if m["status"] == "completed")
+                playing = sum(1 for m in matches if m["status"] == "playing")
+                pending = len(matches) - completed - playing
+                embed.add_field(
+                    name="Матчи",
+                    value=f"✅ {completed} ⚔️ {playing} ⏳ {pending}",
+                    inline=True,
+                )
+
+            if t["status"] == "finished":
+                final_match = next(
+                    (m for m in matches if m["round"] == max(mm["round"] for mm in matches)),
+                    None,
+                )
+                if final_match and final_match["winner_id"]:
+                    champ = await db.team_get(final_match["winner_id"])
+                    if champ:
+                        embed.add_field(
+                            name="🏆 Чемпион",
+                            value=f"**{champ['name']}**",
+                            inline=False,
+                        )
+
+            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+
+        elif t["status"] in ("open", "closed"):
+            teams = await db.team_list(tid)
+            if not teams:
+                await interaction.response.send_message(
+                    "📋 Пока ни одной команды. Сетка ещё не сгенерирована.",
+                    ephemeral=True,
+                )
+                return
+
+            buf = generate_bracket_simple(teams, t["name"])
+            file = discord.File(buf, filename="bracket.png")
+
+            status_emoji = {"open": "🟢", "closed": "🔒"}.get(t["status"], "❓")
+            status_text = {"open": "Регистрация открыта", "closed": "Набор закрыт"}.get(
+                t["status"], t["status"]
+            )
+
+            embed = discord.Embed(title=f"🏆 {t['name']}", color=config.EMBED_COLOR)
+            embed.set_image(url="attachment://bracket.png")
+            embed.add_field(name="Формат", value=fmt, inline=True)
+            embed.add_field(name="Статус", value=f"{status_emoji} {status_text}", inline=True)
+
+            approved = sum(1 for tm in teams if tm.get("approved"))
+            embed.add_field(name="Команд", value=f"{len(teams)} (✅ {approved})", inline=True)
+
+            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
     # -----------------------------------------------------------------------
     # /tournament — группа команд администратора
@@ -1954,6 +2135,51 @@ class TournamentCog(commands.Cog, name="Tournament"):
         await interaction.response.send_message(
             f"🗑 Турнир **{t['name']}** удалён.", ephemeral=True
         )
+
+    # --- /tournament logchannel ---
+
+    @tournament.command(name="logchannel", description="Установить канал для логов турнира")
+    @app_commands.describe(channel="Канал для логов (оставьте пустым чтобы сбросить)")
+    async def tournament_logchannel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message("❌ Только для администрации.", ephemeral=True)
+            return
+
+        if channel is None:
+            await db.tournament_config_set_log_channel(interaction.guild_id, 0)
+            await interaction.response.send_message(
+                "✅ Канал логов сброшен. Логи больше не отправляются.",
+                ephemeral=True,
+            )
+        else:
+            await db.tournament_config_set_log_channel(interaction.guild_id, channel.id)
+            await interaction.response.send_message(
+                f"✅ Канал логов установлен: {channel.mention}\n"
+                f"Теперь сюда будут отправляться: одобрения, отклонения, регистрации, старты матчей и результаты.",
+                ephemeral=True,
+            )
+
+            # Отправляем тестовое сообщение в канал логов
+            embed = discord.Embed(
+                title="📋 Канал логов турнира",
+                description=f"Настроен администратором {interaction.user.mention}\n\n"
+                            f"Сюда будут логироваться:\n"
+                            f"• 📝 Регистрации команд\n"
+                            f"• ✅ Одобрения команд\n"
+                            f"• ❌ Отклонения команд\n"
+                            f"• 🏆 Генерация сетки\n"
+                            f"• ⚔️ Старты матчей\n"
+                            f"• 🏆 Результаты матчей",
+                color=config.EMBED_COLOR,
+            )
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
 
 
 async def setup(bot: commands.Bot) -> None:

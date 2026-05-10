@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS tournament_questions (
     position        INTEGER DEFAULT 0,
     required        INTEGER DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS tournament_config (
+    guild_id        INTEGER PRIMARY KEY,
+    log_channel_id  INTEGER DEFAULT 0
+);
 """
 
 # Миграции для существующих баз
@@ -435,6 +440,29 @@ async def question_count(tournament_id: int) -> int:
         )
         row = await cursor.fetchone()
     return row[0]  # type: ignore
+
+
+# ===========================================================================
+# TOURNAMENT CONFIG (guild-level settings)
+# ===========================================================================
+
+async def tournament_config_get(guild_id: int) -> dict | None:
+    async with _connection() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM tournament_config WHERE guild_id = ?", (guild_id,)
+        )
+    return dict(rows[0]) if rows else None
+
+
+async def tournament_config_set_log_channel(guild_id: int, channel_id: int) -> None:
+    async with _connection() as db:
+        await db.execute(
+            "INSERT INTO tournament_config (guild_id, log_channel_id) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET log_channel_id = excluded.log_channel_id",
+            (guild_id, channel_id),
+        )
+        await db.commit()
 
 
 # ===========================================================================

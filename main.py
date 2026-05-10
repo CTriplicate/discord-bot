@@ -13,8 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import traceback
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import database as db
@@ -72,15 +74,17 @@ class TournamentBot(commands.Bot):
                 logger.info(f"  ✅ {ext}")
             except Exception as exc:
                 logger.error(f"  ❌ {ext}: {exc}")
+                logger.error(traceback.format_exc())
 
         # Синхронизация слэш-команд с Discord
-        # В продакшене рекомендуется синхронизировать только для конкретной гильдии
-        # для мгновенного обновления. Глобальная синхронизация может занимать до часа.
         try:
             synced = await self.tree.sync()
-            logger.info(f"Синхронизировано {len(synced)} слэш-команд.")
+            logger.info(f"Синхронизировано {len(synced)} слэш-команд:")
+            for cmd in synced:
+                logger.info(f"  /{cmd.name}")
         except Exception as exc:
             logger.error(f"Ошибка синхронизации команд: {exc}")
+            logger.error(traceback.format_exc())
 
     async def on_ready(self) -> None:
         """Бот готов к работе."""
@@ -92,11 +96,55 @@ class TournamentBot(commands.Bot):
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        """Глобальный обработчик ошибок."""
+        """Глобальный обработчик ошибок префиксных команд."""
         if isinstance(error, commands.CommandNotFound):
             return
         logger.error(f"Ошибка команды: {error}", exc_info=error)
-        await ctx.send(f"❌ Произошла ошибка: {error}")
+        if ctx.message:
+            await ctx.send(f"❌ Произошла ошибка: {error}")
+
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """
+        Глобальный обработчик ошибок слэш-команд.
+        Гарантирует, что бот ВСЕГДА ответит за 3 секунды,
+        чтобы не было «Приложение не отвечает».
+        """
+        # Логируем полную ошибку
+        logger.error(
+            f"Ошибка слэш-команды /{interaction.command.name if interaction.command else '?'}: "
+            f"{error}",
+        )
+        logger.error(traceback.format_exc())
+
+        # Формируем текст ошибки для пользователя
+        if isinstance(error, app_commands.CheckFailure):
+            msg = "❌ У вас нет прав для использования этой команды."
+        elif isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"⏳ Подождите {error.retry_after:.0f} секунд перед повторным использованием."
+        elif isinstance(error, app_commands.MissingRole):
+            msg = f"❌ Необходима роль: {error.missing_role}"
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            perms = ", ".join(error.missing_permissions)
+            msg = f"❌ Боту не хватает прав: {perms}"
+        else:
+            msg = f"❌ Произошла ошибка: {error}"
+
+        # Пытаемся ответить (interaction мог быть уже обработан)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.InteractionResponded:
+            # Уже ответили — шлём followup
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +154,6 @@ class TournamentBot(commands.Bot):
 async def main() -> None:
     token = config.TOKEN
     if token == "YOUR_BOT_TOKEN_HERE":
-        # Проверяем переменную окружения
         import os
         token = os.environ.get("BOT_TOKEN", "")
 

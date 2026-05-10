@@ -1,14 +1,17 @@
 """
 Модуль Warning — система штрафов с выдачей ролей.
 
-Команды:
-  /warning add   @user [причина]       — выдать штраф
+Команды (подкоманды группы /warning):
+  /warning add    @user [причина]       — выдать штраф
   /warning remove <id>                  — убрать штраф по ID
-  /warning set   @role [@role ...]      — указать роли, выдающиеся при штрафе
-  /warning list  [@user]                — список штрафов (всех или конкретного пользователя)
+  /warning set    @role [@role ...]     — указать роли, выдающиеся при штрафе
+  /warning list   [@user]               — список штрафов (всех или конкретного пользователя)
 """
 
 from __future__ import annotations
+
+import json
+import re
 
 import discord
 from discord import app_commands
@@ -18,79 +21,35 @@ import database as db
 import config
 
 
-class WarningCog(commands.Cog, name="Warning"):
-    """Система штрафов с выдачей ролей."""
+async def _is_admin(interaction: discord.Interaction) -> bool:
+    """Проверка: пользователь имеет одну из админ-ролей."""
+    if interaction.user.guild_permissions.administrator:
+        return True
+    user_roles = {r.name for r in interaction.user.roles}
+    return bool(user_roles & set(config.ADMIN_ROLES))
 
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_admin(interaction: discord.Interaction) -> bool:
-        """Проверка: пользователь имеет одну из админ-ролей."""
-        if interaction.user.guild_permissions.administrator:
-            return True
-        user_roles = {r.name for r in interaction.user.roles}
-        return bool(user_roles & set(config.ADMIN_ROLES))
+class WarningGroup(app_commands.Group, name="warning", description="Управление штрафами"):
+    """Группа подкоманд /warning add | remove | set | list"""
 
     # ------------------------------------------------------------------
     # /warning add
     # ------------------------------------------------------------------
 
-    @app_commands.command(
-        name="warning",
-        description="Управление штрафами",
-    )
+    @app_commands.command(name="add", description="Выдать штраф пользователю")
     @app_commands.describe(
-        action="Действие: add, remove, set, list",
-        user="Пользователь (для add / list)",
-        warning_id="ID штрафа (для remove)",
-        reason="Причина штрафа (для add)",
-        roles="Роли для выдачи при штрафе (для set, через пробел)",
+        user="Пользователь, которому выдаётся штраф",
+        reason="Причина штрафа",
     )
-    async def warning(
+    async def warning_add(
         self,
         interaction: discord.Interaction,
-        action: str,
-        user: discord.Member | None = None,
-        warning_id: int | None = None,
-        reason: str | None = None,
-        roles: str | None = None,
+        user: discord.Member,
+        reason: str = "Причина не указана",
     ) -> None:
-        """Единая точка входа для подкоманд warning."""
-        if not self._is_admin(interaction):
+        if not await _is_admin(interaction):
             await interaction.response.send_message(
                 "❌ У вас нет прав для использования этой команды.", ephemeral=True
-            )
-            return
-
-        action = action.lower().strip()
-        if action == "add":
-            await self._add(interaction, user, reason)
-        elif action == "remove":
-            await self._remove(interaction, warning_id)
-        elif action == "set":
-            await self._set_roles(interaction, roles)
-        elif action == "list":
-            await self._list(interaction, user)
-        else:
-            await interaction.response.send_message(
-                "❌ Неизвестное действие. Используйте: `add`, `remove`, `set`, `list`.",
-                ephemeral=True,
-            )
-
-    async def _add(
-        self,
-        interaction: discord.Interaction,
-        user: discord.Member | None,
-        reason: str | None,
-    ) -> None:
-        if user is None:
-            await interaction.response.send_message(
-                "❌ Укажите пользователя: `/warning add @user [причина]`", ephemeral=True
             )
             return
 
@@ -99,8 +58,6 @@ class WarningCog(commands.Cog, name="Warning"):
                 "❌ Нельзя выдать штраф боту.", ephemeral=True
             )
             return
-
-        reason = reason or "Причина не указана"
 
         # Получаем роли для штрафа из БД
         warn_role_ids = await db.warning_get_roles(interaction.guild_id)  # type: ignore
@@ -113,7 +70,7 @@ class WarningCog(commands.Cog, name="Warning"):
                     await user.add_roles(role, reason=f"Штраф: {reason}")
                     roles_given.append(role_id)
                 except discord.Forbidden:
-                    pass  # Нет прав — пропускаем
+                    pass
 
         # Записываем в БД
         wid = await db.warning_add(
@@ -126,10 +83,7 @@ class WarningCog(commands.Cog, name="Warning"):
 
         count = await db.warning_count(interaction.guild_id, user.id)  # type: ignore
 
-        embed = discord.Embed(
-            title="⚠️ Штраф выдан",
-            color=config.EMBED_COLOR,
-        )
+        embed = discord.Embed(title="⚠️ Штраф выдан", color=config.EMBED_COLOR)
         embed.add_field(name="Пользователь", value=user.mention, inline=True)
         embed.add_field(name="Модератор", value=interaction.user.mention, inline=True)
         embed.add_field(name="Причина", value=reason, inline=False)
@@ -137,12 +91,9 @@ class WarningCog(commands.Cog, name="Warning"):
         embed.add_field(name="Всего штрафов", value=str(count), inline=True)
 
         if roles_given:
-            role_mentions = " ".join(
-                f"<@&{rid}>" for rid in roles_given
-            )
+            role_mentions = " ".join(f"<@&{rid}>" for rid in roles_given)
             embed.add_field(name="Выданные роли", value=role_mentions, inline=False)
 
-        # Проверка лимита
         if config.MAX_WARNINGS > 0 and count >= config.MAX_WARNINGS:
             embed.add_field(
                 name="🚨 Достигнут лимит штрафов!",
@@ -152,18 +103,24 @@ class WarningCog(commands.Cog, name="Warning"):
 
         await interaction.response.send_message(embed=embed)
 
-    async def _remove(
+    # ------------------------------------------------------------------
+    # /warning remove
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="remove", description="Убрать штраф по ID")
+    @app_commands.describe(warning_id="ID штрафа для снятия")
+    async def warning_remove(
         self,
         interaction: discord.Interaction,
-        warning_id: int | None,
+        warning_id: int,
     ) -> None:
-        if warning_id is None:
+        if not await _is_admin(interaction):
             await interaction.response.send_message(
-                "❌ Укажите ID штрафа: `/warning remove <id>`", ephemeral=True
+                "❌ У вас нет прав для использования этой команды.", ephemeral=True
             )
             return
 
-        # Сначала получаем штраф, чтобы снять роли
+        # Получаем штраф, чтобы снять роли
         warnings = await db.warning_list(interaction.guild_id)  # type: ignore
         target = next((w for w in warnings if w["id"] == warning_id), None)
 
@@ -184,7 +141,6 @@ class WarningCog(commands.Cog, name="Warning"):
         member = interaction.guild.get_member(target["user_id"])  # type: ignore
         roles_removed: list[str] = []
         if member:
-            import json
             for role_id in json.loads(target["roles_given"]):
                 role = interaction.guild.get_role(role_id)  # type: ignore
                 if role and role in member.roles:
@@ -200,24 +156,33 @@ class WarningCog(commands.Cog, name="Warning"):
             color=config.EMBED_COLOR,
         )
         if roles_removed:
-            embed.add_field(
-                name="Снятые роли", value=", ".join(roles_removed), inline=False
-            )
+            embed.add_field(name="Снятые роли", value=", ".join(roles_removed), inline=False)
 
         await interaction.response.send_message(embed=embed)
 
-    async def _set_roles(
+    # ------------------------------------------------------------------
+    # /warning set
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="set", description="Указать роли, выдающиеся при штрафе")
+    @app_commands.describe(roles="Роли для выдачи при штрафе (упоминания @role)")
+    async def warning_set(
         self,
         interaction: discord.Interaction,
-        roles_str: str | None,
+        roles: str = "",
     ) -> None:
-        if not roles_str:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message(
+                "❌ У вас нет прав для использования этой команды.", ephemeral=True
+            )
+            return
+
+        if not roles:
             # Показать текущие настройки
             role_ids = await db.warning_get_roles(interaction.guild_id)  # type: ignore
             if not role_ids:
                 await interaction.response.send_message(
-                    "📋 Роли для штрафов не настроены. Используйте: "
-                    "`/warning set @role1 @role2 ...`",
+                    "📋 Роли для штрафов не настроены. Используйте: `/warning set @role1 @role2`",
                     ephemeral=True,
                 )
                 return
@@ -228,12 +193,11 @@ class WarningCog(commands.Cog, name="Warning"):
             )
             return
 
-        # Парсим роли из строки (поддержка упоминаний и ID)
-        import re
+        # Парсим роли (поддержка упоминаний и ID)
         role_ids: list[int] = []
-        for match in re.findall(r"<@&(\d+)>", roles_str):
+        for match in re.findall(r"<@&(\d+)>", roles):
             role_ids.append(int(match))
-        for part in roles_str.split():
+        for part in roles.split():
             if part.isdigit():
                 role_ids.append(int(part))
 
@@ -261,11 +225,23 @@ class WarningCog(commands.Cog, name="Warning"):
         )
         await interaction.response.send_message(embed=embed)
 
-    async def _list(
+    # ------------------------------------------------------------------
+    # /warning list
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="list", description="Список штрафов")
+    @app_commands.describe(user="Пользователь (необязательно, для фильтрации)")
+    async def warning_list(
         self,
         interaction: discord.Interaction,
-        user: discord.Member | None,
+        user: discord.Member | None = None,
     ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message(
+                "❌ У вас нет прав для использования этой команды.", ephemeral=True
+            )
+            return
+
         user_id = user.id if user else None
         warnings = await db.warning_list(interaction.guild_id, user_id)  # type: ignore
 
@@ -277,21 +253,18 @@ class WarningCog(commands.Cog, name="Warning"):
             return
 
         embed = discord.Embed(
-            title=f"⚠️ Штрафы" + (f" — {user.display_name}" if user else ""),
+            title="⚠️ Штрафы" + (f" — {user.display_name}" if user else ""),
             color=config.EMBED_COLOR,
         )
 
-        import json
         lines: list[str] = []
-        for w in warnings[:25]:  # Лимит embed-полей
+        for w in warnings[:25]:
             member = interaction.guild.get_member(w["user_id"])  # type: ignore
             name = member.display_name if member else f"<@{w['user_id']}>"
             mod = interaction.guild.get_member(w["moderator_id"])  # type: ignore
             mod_name = mod.display_name if mod else f"<@{w['moderator_id']}>"
             roles_given = json.loads(w["roles_given"])
-            roles_text = (
-                " ".join(f"<@&{rid}>" for rid in roles_given) if roles_given else "—"
-            )
+            roles_text = " ".join(f"<@&{rid}>" for rid in roles_given) if roles_given else "—"
             lines.append(
                 f"**#{w['id']}** | {name} | Мод: {mod_name}\n"
                 f"Причина: {w['reason']} | Роли: {roles_text}\n"
@@ -300,6 +273,17 @@ class WarningCog(commands.Cog, name="Warning"):
 
         embed.description = "\n\n".join(lines)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class WarningCog(commands.Cog, name="Warning"):
+    """Система штрафов с выдачей ролей."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.warning_group = WarningGroup()
+
+    async def cog_load(self) -> None:
+        self.bot.tree.add_command(self.warning_group)
 
 
 async def setup(bot: commands.Bot) -> None:

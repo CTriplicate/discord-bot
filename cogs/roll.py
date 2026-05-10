@@ -1,10 +1,10 @@
 """
 Модуль Roll — розыгрыш приза среди участников.
 
-Команды:
+Команды (подкоманды группы /roll):
   /roll start <приз> <время_сек>   — начать розыгрыш (30–172800 сек)
-  /roll emergency <roll_id>         — аварийный ролл (сразу определить победителя)
-  /roll delete <roll_id>            — удалить розыгрыш
+  /roll emergency [roll_id]        — аварийный ролл (сразу определить победителя)
+  /roll delete <roll_id>           — удалить розыгрыш
 
 Механика:
   - При создании ролла бот отправляет embed с кнопкой «Участвовать».
@@ -43,7 +43,6 @@ class ParticipateButton(discord.ui.Button):
         self.roll_id = roll_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        # Проверяем, активен ли ещё ролл
         roll = await db.roll_get(self.roll_id)
         if not roll or not roll["active"]:
             await interaction.response.send_message(
@@ -98,160 +97,45 @@ class RollView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# Cog
+# Helper
 # ---------------------------------------------------------------------------
 
-class RollCog(commands.Cog, name="Roll"):
-    """Розыгрыш призов среди участников."""
+async def _is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    user_roles = {r.name for r in interaction.user.roles}
+    return bool(user_roles & set(config.ADMIN_ROLES))
 
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
-        self._tasks: dict[int, asyncio.Task] = {}  # roll_id -> Task
 
-    async def cog_load(self) -> None:
-        """Восстанавливаем незавершённые роллы при перезапуске бота."""
-        # Проходим по всем гильдиям и ищем активные роллы
-        # (нужно, чтобы бот не «забыл» о роллах после рестарта)
-        for guild in self.bot.guilds:
-            active_rolls = await db.roll_get_active(guild.id)
-            for roll in active_rolls:
-                remaining = roll["end_time"] - time.time()
-                if remaining <= 0:
-                    # Время уже вышло — сразу роллим
-                    asyncio.create_task(self._conclude_roll(roll["id"]))
-                else:
-                    # Планируем завершение
-                    self._schedule_roll(roll["id"], remaining)
+# ---------------------------------------------------------------------------
+# Группа подкоманд /roll
+# ---------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_admin(interaction: discord.Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
-            return True
-        user_roles = {r.name for r in interaction.user.roles}
-        return bool(user_roles & set(config.ADMIN_ROLES))
-
-    def _schedule_roll(self, roll_id: int, delay: float) -> None:
-        """Планирует задачу на завершение ролла."""
-        if roll_id in self._tasks:
-            self._tasks[roll_id].cancel()
-        self._tasks[roll_id] = asyncio.create_task(self._roll_worker(roll_id, delay))
-
-    async def _roll_worker(self, roll_id: int, delay: float) -> None:
-        """Ждёт указанное время и завершает ролл."""
-        try:
-            await asyncio.sleep(delay)
-            await self._conclude_roll(roll_id)
-        except asyncio.CancelledError:
-            pass
-
-    async def _conclude_roll(self, roll_id: int) -> None:
-        """Определяет победителя и отправляет результат."""
-        roll = await db.roll_get(roll_id)
-        if not roll or not roll["active"]:
-            return
-
-        await db.roll_finish(roll_id)
-
-        participants = await db.roll_participants_list(roll_id)
-        channel = self.bot.get_channel(roll["channel_id"])
-        if not channel:
-            return
-
-        # Формируем embed результата
-        embed = discord.Embed(
-            title="🎉 Розыгрыш завершён!",
-            description=f"**Приз:** {roll['prize_text']}",
-            color=config.EMBED_COLOR,
-        )
-        embed.add_field(name="Участников", value=str(len(participants)), inline=True)
-
-        if not participants:
-            embed.add_field(
-                name="Результат",
-                value="❌ Никто не участвовал — приз не разыгран.",
-                inline=False,
-            )
-        else:
-            # Казино-ролл: абсолютно случайный выбор через secrets
-            winner_id = secrets.choice(participants)
-            embed.add_field(
-                name="🏆 Победитель",
-                value=f"<@{winner_id}>",
-                inline=False,
-            )
-
-        # Обновляем исходное сообщение
-        if roll["message_id"]:
-            try:
-                msg = await channel.fetch_message(roll["message_id"])
-                # Отключаем кнопки
-                view = RollView(roll_id)
-                for item in view.children:
-                    item.disabled = True
-                await msg.edit(view=view)
-            except discord.NotFound:
-                pass
-
-        await channel.send(embed=embed)
-
-        # Очистка задачи
-        self._tasks.pop(roll_id, None)
+class RollGroup(app_commands.Group, name="roll", description="Розыгрыш призов"):
+    """Группа подкоманд /roll start | emergency | delete"""
 
     # ------------------------------------------------------------------
     # /roll start
     # ------------------------------------------------------------------
 
-    @app_commands.command(name="roll", description="Розыгрыш призов")
+    @app_commands.command(name="start", description="Начать розыгрыш приза")
     @app_commands.describe(
-        action="Действие: start, emergency, delete",
         prize="Описание приза",
-        time_seconds="Время до результата (30–172800 сек)",
-        roll_id="ID розыгрыша (для emergency / delete)",
+        time_seconds="Время до результата в секундах (30–172800)",
     )
-    async def roll(
+    async def roll_start(
         self,
         interaction: discord.Interaction,
-        action: str,
-        prize: str | None = None,
-        time_seconds: int | None = None,
-        roll_id: int | None = None,
+        prize: str,
+        time_seconds: int,
     ) -> None:
-        if not self._is_admin(interaction):
+        if not await _is_admin(interaction):
             await interaction.response.send_message(
                 "❌ У вас нет прав для использования этой команды.", ephemeral=True
             )
             return
 
-        action = action.lower().strip()
-        if action == "start":
-            await self._start(interaction, prize, time_seconds)
-        elif action == "emergency":
-            await self._emergency(interaction, roll_id)
-        elif action == "delete":
-            await self._delete(interaction, roll_id)
-        else:
-            await interaction.response.send_message(
-                "❌ Неизвестное действие. Используйте: `start`, `emergency`, `delete`.",
-                ephemeral=True,
-            )
-
-    async def _start(
-        self,
-        interaction: discord.Interaction,
-        prize: str | None,
-        time_seconds: int | None,
-    ) -> None:
-        if not prize:
-            await interaction.response.send_message(
-                "❌ Укажите приз: `/roll start <приз> <время_сек>`", ephemeral=True
-            )
-            return
-
-        if time_seconds is None or time_seconds < 30 or time_seconds > 172800:
+        if time_seconds < 30 or time_seconds > 172800:
             await interaction.response.send_message(
                 "❌ Время должно быть от 30 до 172800 секунд (48 часов).",
                 ephemeral=True,
@@ -296,16 +180,29 @@ class RollCog(commands.Cog, name="Roll"):
         msg = await interaction.original_response()
         await db.roll_set_message(rid, msg.id)
 
-        # Планируем завершение
-        self._schedule_roll(rid, float(time_seconds))
+        # Планируем завершение — берём cog через бот
+        cog: RollCog | None = interaction.client.get_cog("Roll")  # type: ignore
+        if cog:
+            cog._schedule_roll(rid, float(time_seconds))
 
-    async def _emergency(
+    # ------------------------------------------------------------------
+    # /roll emergency
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="emergency", description="Аварийный ролл — определить победителя сразу")
+    @app_commands.describe(roll_id="ID розыгрыша (необязательно, если один активный)")
+    async def roll_emergency(
         self,
         interaction: discord.Interaction,
-        roll_id: int | None,
+        roll_id: int | None = None,
     ) -> None:
+        if not await _is_admin(interaction):
+            await interaction.response.send_message(
+                "❌ У вас нет прав для использования этой команды.", ephemeral=True
+            )
+            return
+
         if roll_id is None:
-            # Если ID не указан — ищем активный ролл в канале
             active = await db.roll_get_active(interaction.guild_id)  # type: ignore
             channel_rolls = [r for r in active if r["channel_id"] == interaction.channel_id]
             if not channel_rolls:
@@ -328,21 +225,27 @@ class RollCog(commands.Cog, name="Roll"):
             f"⚡ Аварийный ролл розыгрыша #{roll_id}! Определяем победителя...",
         )
 
-        # Отменяем запланированную задачу
-        if roll_id in self._tasks:
-            self._tasks[roll_id].cancel()
-            self._tasks.pop(roll_id, None)
+        cog: RollCog | None = interaction.client.get_cog("Roll")  # type: ignore
+        if cog:
+            if roll_id in cog._tasks:
+                cog._tasks[roll_id].cancel()
+                cog._tasks.pop(roll_id, None)
+            await cog._conclude_roll(roll_id)
 
-        await self._conclude_roll(roll_id)
+    # ------------------------------------------------------------------
+    # /roll delete
+    # ------------------------------------------------------------------
 
-    async def _delete(
+    @app_commands.command(name="delete", description="Удалить розыгрыш")
+    @app_commands.describe(roll_id="ID розыгрыша для удаления")
+    async def roll_delete(
         self,
         interaction: discord.Interaction,
-        roll_id: int | None,
+        roll_id: int,
     ) -> None:
-        if roll_id is None:
+        if not await _is_admin(interaction):
             await interaction.response.send_message(
-                "❌ Укажите ID розыгрыша: `/roll delete <roll_id>`", ephemeral=True
+                "❌ У вас нет прав для использования этой команды.", ephemeral=True
             )
             return
 
@@ -353,30 +256,113 @@ class RollCog(commands.Cog, name="Roll"):
             )
             return
 
-        # Отменяем задачу
-        if roll_id in self._tasks:
-            self._tasks[roll_id].cancel()
-            self._tasks.pop(roll_id, None)
+        cog: RollCog | None = interaction.client.get_cog("Roll")  # type: ignore
+        if cog and roll_id in cog._tasks:
+            cog._tasks[roll_id].cancel()
+            cog._tasks.pop(roll_id, None)
 
         # Пытаемся удалить сообщение
         if roll["message_id"]:
-            channel = self.bot.get_channel(roll["channel_id"])
+            channel = interaction.client.get_channel(roll["channel_id"])
             if channel:
                 try:
-                    msg = await channel.fetch_message(roll["message_id"])
+                    msg = await channel.fetch_message(roll["message_id"])  # type: ignore
                     await msg.delete()
                 except discord.NotFound:
                     pass
 
         deleted = await db.roll_delete(roll_id)
         if deleted:
-            await interaction.response.send_message(
-                f"✅ Розыгрыш #{roll_id} удалён."
-            )
+            await interaction.response.send_message(f"✅ Розыгрыш #{roll_id} удалён.")
         else:
             await interaction.response.send_message(
                 f"❌ Не удалось удалить розыгрыш #{roll_id}.", ephemeral=True
             )
+
+
+# ---------------------------------------------------------------------------
+# Cog
+# ---------------------------------------------------------------------------
+
+class RollCog(commands.Cog, name="Roll"):
+    """Розыгрыш призов среди участников."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self._tasks: dict[int, asyncio.Task] = {}  # roll_id -> Task
+        self.roll_group = RollGroup()
+
+    async def cog_load(self) -> None:
+        self.bot.tree.add_command(self.roll_group)
+
+        # Восстанавливаем незавершённые роллы при перезапуске
+        for guild in self.bot.guilds:
+            active_rolls = await db.roll_get_active(guild.id)
+            for roll in active_rolls:
+                remaining = roll["end_time"] - time.time()
+                if remaining <= 0:
+                    asyncio.create_task(self._conclude_roll(roll["id"]))
+                else:
+                    self._schedule_roll(roll["id"], remaining)
+
+    def _schedule_roll(self, roll_id: int, delay: float) -> None:
+        if roll_id in self._tasks:
+            self._tasks[roll_id].cancel()
+        self._tasks[roll_id] = asyncio.create_task(self._roll_worker(roll_id, delay))
+
+    async def _roll_worker(self, roll_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self._conclude_roll(roll_id)
+        except asyncio.CancelledError:
+            pass
+
+    async def _conclude_roll(self, roll_id: int) -> None:
+        """Определяет победителя и отправляет результат."""
+        roll = await db.roll_get(roll_id)
+        if not roll or not roll["active"]:
+            return
+
+        await db.roll_finish(roll_id)
+
+        participants = await db.roll_participants_list(roll_id)
+        channel = self.bot.get_channel(roll["channel_id"])
+        if not channel:
+            return
+
+        embed = discord.Embed(
+            title="🎉 Розыгрыш завершён!",
+            description=f"**Приз:** {roll['prize_text']}",
+            color=config.EMBED_COLOR,
+        )
+        embed.add_field(name="Участников", value=str(len(participants)), inline=True)
+
+        if not participants:
+            embed.add_field(
+                name="Результат",
+                value="❌ Никто не участвовал — приз не разыгран.",
+                inline=False,
+            )
+        else:
+            winner_id = secrets.choice(participants)
+            embed.add_field(
+                name="🏆 Победитель",
+                value=f"<@{winner_id}>",
+                inline=False,
+            )
+
+        if roll["message_id"]:
+            try:
+                msg = await channel.fetch_message(roll["message_id"])  # type: ignore
+                view = RollView(roll_id)
+                for item in view.children:
+                    item.disabled = True
+                await msg.edit(view=view)
+            except discord.NotFound:
+                pass
+
+        await channel.send(embed=embed)
+        self._tasks.pop(roll_id, None)
 
 
 async def setup(bot: commands.Bot) -> None:
